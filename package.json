@@ -1,0 +1,18 @@
+{
+  "name": "@openclaw/skill-waf-fuzzer",
+  "version": "0.1.0",
+  "description": "OpenClaw 技能：基于 LLM 的 WAF 语义引擎绕过测试样本库构建工具，覆盖命令注入、SQL 注入、Log4j 反序列化场景。",
+  "main": "index.ts",
+  "openclaw": {
+    "skill": "waf-fuzzer",
+    "entry": "index.ts",
+    "description": "WAF 绕过模糊测试 (Command Injection / SQLi / Log4j)"
+  },
+  "scripts": {
+    "start": "npx tsx index.ts"
+  },
+  "engines": {
+    "node": ">=18",
+    "python": ">=3.10"
+  }
+}

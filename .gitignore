@@ -1,0 +1,12 @@
+.vs/
+.claude/
+.vscode/
+__pycache__/
+*.pyc
+node_modules/
+config/target.yaml
+config/*.yml
+config/*.json
+.env
+output/
+*.log
