@@ -33,7 +33,7 @@ if sys.stdout.encoding not in (None, "utf-8") and hasattr(sys.stdout, "buffer"):
 from llm_engine import init_client as init_llm_client, generate_initial_payloads, mutate_payloads
 from baseliner import run_baseline
 from requester import batch_send, send_cmdi_cleanup
-from memory_compressor import load_kb, consolidate_kb, get_kb_context, compress_cot_analyses
+from memory_compressor import load_kb, load_base_rules, consolidate_kb, get_kb_context, compress_cot_analyses
 
 # ============================================================
 # 终端颜色
@@ -182,6 +182,38 @@ def _categorize_payload(payload: str, vuln_type: str = "") -> str:
     return "直接读取"
 
 
+def _format_evidence_summary(evidence: str, vuln_type: str) -> str:
+    """格式化证据摘要，输出有意义的内容，过滤无信息价值的噪声。
+
+    - CMDI：输出有效回显（如 root:x:0:0:root...），过滤 ping 回显
+    - SQLi：输出数据库提取数据或延时信息
+    - 无意义回显不输出
+    """
+    if not evidence:
+        return ""
+
+    lines = evidence.splitlines()
+    meaningful = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # 过滤无信息价值的 ping 回显
+        if re.search(r'(?:bytes from|icmp_seq=|ttl=|time=[\d.]+\s*ms)', stripped, re.IGNORECASE):
+            continue
+        # 过滤纯数字时间戳（假阳性风险）
+        if re.match(r'^\d{6,}$', stripped):
+            continue
+        meaningful.append(stripped)
+
+    if not meaningful:
+        return evidence[:120]
+
+    summary = " | ".join(meaningful[:3])
+    return summary[:200]
+
+
 # ============================================================
 # 报告落盘 (纯文本格式)
 # ============================================================
@@ -280,8 +312,8 @@ def main(config_path: str = CONFIG_PATH) -> int:
 
     # ---- 初始化 LLM ----
     api_key = llm_cfg.get("api_key", "")
-    base_url = llm_cfg.get("base_url", "https://api.deepseek.com")
-    model = llm_cfg.get("model", "deepseek-v4-pro")
+    base_url = llm_cfg.get("base_url", "https://token-plan-cn.xiaomimimimo.com/v1")
+    model = llm_cfg.get("model", "mimo-v2.5-pro")
 
     if not api_key:
         print(f"{C['ERROR']} 请在 target.yaml 中填写 api_key 后重试。")
@@ -292,8 +324,12 @@ def main(config_path: str = CONFIG_PATH) -> int:
     print()
 
     # ---- 加载历史 WAF 规则知识库 ----
+    base_rules = load_base_rules()
     kb_context = get_kb_context()
-    if kb_context:
+    if base_rules:
+        print(f"{C['KB']} 已加载基础规则 ({len(base_rules)} 条) + Agent 学习规则 ({len(load_kb())} 条)")
+        print()
+    elif kb_context:
         print(f"{C['KB']} 已加载历史 WAF 拦截经验 ({len(load_kb())} 条记录)")
         print()
     else:
@@ -305,11 +341,11 @@ def main(config_path: str = CONFIG_PATH) -> int:
     if not selected:
         return 0
 
-    max_iterations = fuzz_cfg.get("max_iterations", 20)
+    max_iterations = fuzz_cfg.get("max_iterations", 100)
     batch_size = fuzz_cfg.get("batch_size", 15)
     concurrency = fuzz_cfg.get("concurrency", 5)
     request_timeout = fuzz_cfg.get("request_timeout", 10)
-    early_stop = fuzz_cfg.get("early_stop_on_all_blocked", 3)
+    early_stop = fuzz_cfg.get("early_stop_on_all_blocked", 100)
 
     # ---- 逐 target 执行 ----
     for t_idx, target in enumerate(selected, 1):
@@ -367,6 +403,7 @@ def main(config_path: str = CONFIG_PATH) -> int:
         total_bypass = 0
         current_payloads: list[str] = []
         cot_entries: list[str] = []  # 收集本轮所有 CoT 分析字符串
+        force_strategy_change = False
 
         while iteration < max_iterations:
             iteration += 1
@@ -383,7 +420,7 @@ def main(config_path: str = CONFIG_PATH) -> int:
             else:
                 print(f"{C['BATCH']} 第 {iteration} 轮  调用 LLM 变异 Payload...")
                 try:
-                    result = mutate_payloads(failed_list, vuln_type=vuln_type, target_url=url, model=model, kb_context=kb_filtered)
+                    result = mutate_payloads(failed_list, vuln_type=vuln_type, target_url=url, model=model, kb_context=kb_filtered, force_strategy_change=force_strategy_change)
                 except Exception as e:
                     print(f"{C['ERROR']} LLM 变异失败: {e}")
                     break
@@ -403,6 +440,15 @@ def main(config_path: str = CONFIG_PATH) -> int:
             if not current_payloads:
                 print(f"{C['WARN']} LLM 返回空 Payload 列表，终止循环。")
                 break
+
+            # 规范化：LLM 有时返回 {"payload": "...", "description": "..."} 字典而非纯字符串
+            normalized = []
+            for p in current_payloads:
+                if isinstance(p, dict):
+                    normalized.append(p.get("payload", p.get("text", json.dumps(p, ensure_ascii=False))))
+                else:
+                    normalized.append(str(p))
+            current_payloads = normalized
 
             # 限制本批次数量
             current_payloads = current_payloads[:batch_size]
@@ -431,6 +477,7 @@ def main(config_path: str = CONFIG_PATH) -> int:
                 concurrency=concurrency,
                 timeout=request_timeout,
                 baseline_html=baseline_html,
+                vuln_type=vuln_type,
             )
             t_send_elapsed = time.perf_counter() - t_send_start
 
@@ -455,7 +502,9 @@ def main(config_path: str = CONFIG_PATH) -> int:
                 if pre_evidence:
                     # Parser 已成功提取证据 → Bypass 成功！
                     print(f"{C['BYPASS_SUCCESS']} {pl[:60]:<60s}  │ 状态码 {sc}  证据提取成功!")
-                    print(f"  {C['EVIDENCE']} {pre_evidence[:120]}")
+                    # 输出有意义的证据摘要（过滤无信息价值的内容）
+                    evidence_summary = _format_evidence_summary(pre_evidence, vuln_type)
+                    print(f"  {C['EVIDENCE']} {evidence_summary}")
                     bypass_in_round += 1
                     total_bypass += 1
                     record_bypass({
@@ -491,10 +540,12 @@ def main(config_path: str = CONFIG_PATH) -> int:
                 consecutive_all_blocked += 1
                 print(f"{C['WARN']} 本轮全部被拦截! 连续全拦截: {consecutive_all_blocked}/{early_stop}")
                 if consecutive_all_blocked >= early_stop:
-                    print(f"{C['WARN']} 连续 {early_stop} 轮全部被拦截，提前终止本目标。")
-                    break
+                    print(f"{C['WARN']} 连续 {early_stop} 轮全部被拦截，下一轮将提醒 LLM 换思路。")
+                    force_strategy_change = True
+                    consecutive_all_blocked = 0
             else:
                 consecutive_all_blocked = 0
+                force_strategy_change = False
 
             # ---- 每轮结束：压缩本轮的 CoT 分析 + 拦截规律，即时更新 KB ----
             if cot_entries:

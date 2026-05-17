@@ -6,7 +6,8 @@ requester.py  HTTP 发包客户端
 1. 根据 target.yaml 配置构建 HTTP 请求（支持 GET/POST）。
 2. 将 Payload 替换进 {{INJECT}} 占位符后发送。
 3. 短路拦截：403/406 等状态码直接返回 blocked 信号，不读取响应体。
-4. 超时控制 + 异常捕获，保证高频发包稳定性。
+4. LLM 驱动的通用 Session 预热（非硬编码 DVWA）。
+5. 超时控制 + 异常捕获，保证高频发包稳定性。
 """
 
 import re
@@ -55,17 +56,16 @@ def _parse_cookies(cookie_str: str) -> dict[str, str]:
 
 
 def warmup_session(target_url: str, cookie_str: str = "", timeout: int = DEFAULT_TIMEOUT) -> bool:
-    """预热 WAF 会话：访问根路径获取新鲜 sl-session，然后自动登录 DVWA。
+    """LLM 驱动的通用 Session 预热。
 
-    雷池 WAF 将 sl-session 与 PHPSESSID 绑定——不同 sl-session 下的 PHPSESSID
-    混用会被判定为 session 篡改并静默丢包。因此预热流程必须：
-    1. GET / 获取 WAF 分配的 sl-session + 新的 PHPSESSID
-    2. POST /login.php 用 admin/password 登录，使新 PHPSESSID 得到认证
-
-    cookie_str 参数仅用于提取 security 等级（若存在），PHPSESSID 不再保留。
+    流程：
+    1. GET 目标页面 → 获取页面内容和初始 Cookie
+    2. LLM 分析页面 → 判断是否需要登录、登录表单字段、CSRF token 等
+    3. 按 LLM 指令执行登录流程（GET/POST 序列）
+    4. 失败时将错误反馈给 LLM，LLM 分析原因并调整方案，最多 3 次
 
     Returns:
-        True 表示预热+登录成功，False 表示失败（不阻塞主流程）。
+        True 表示预热成功（或不需要登录），False 表示失败。
     """
     parsed = urlparse(target_url)
     host_key = f"{parsed.hostname}:{parsed.port or 80}"
@@ -78,47 +78,158 @@ def warmup_session(target_url: str, cookie_str: str = "", timeout: int = DEFAULT
         base_url += f":{parsed.port}"
 
     try:
-        # 1. 访问根路径 → WAF 分配 sl-session + DVWA 分配 PHPSESSID
-        _SESSION.get(
-            base_url + "/",
+        # 1. 访问目标页面获取初始 Cookie 和页面内容
+        resp = _SESSION.get(
+            target_url,
             headers=_FALLBACK_HEADERS,
             timeout=timeout,
-            allow_redirects=False,
+            allow_redirects=True,
         )
+        page_content = resp.text
 
-        # 2. DVWA 登录 — 需要先 GET login.php 获取 CSRF user_token
-        login_page = _SESSION.get(
-            base_url + "/login.php",
-            headers=_FALLBACK_HEADERS,
-            timeout=timeout,
-        )
-        token_match = re.search(
-            r"name=['\"]user_token['\"]\s+value=['\"]([^'\"]+)['\"]",
-            login_page.text,
-        )
-        user_token = token_match.group(1) if token_match else ""
+        # 2. 调用 LLM 分析页面
+        from llm_engine import analyze_login_page, analyze_warmup_failure
+        analysis = analyze_login_page(target_url, page_content)
 
-        _SESSION.post(
-            base_url + "/login.php",
-            data=f"username=admin&password=password&Login=Login&user_token={user_token}",
+        if not analysis.get("need_login", False):
+            _WARMED_HOSTS.add(host_key)
+            return True
+
+        # 3. 按 LLM 指令执行登录流程（最多 3 次尝试）
+        current_plan = analysis
+        for attempt in range(3):
+            success, status_code, response_text, error = _execute_login(
+                base_url, current_plan, timeout
+            )
+            if success:
+                _WARMED_HOSTS.add(host_key)
+                return True
+
+            # 失败 → LLM 分析原因并调整方案
+            if attempt < 2:
+                failure_analysis = analyze_warmup_failure(
+                    target_url=target_url,
+                    last_plan=current_plan,
+                    status_code=status_code,
+                    response_text=response_text,
+                    error=error,
+                )
+                diagnosis = failure_analysis.get("diagnosis", "")
+                new_plan = failure_analysis.get("new_plan", {})
+                if new_plan:
+                    current_plan = {**current_plan, **new_plan}
+                print(f"  [WARMUP] 登录失败 (尝试 {attempt+1}/3): {diagnosis[:100]}")
+            else:
+                print(f"  [WARMUP] 登录失败 (3次均失败): {error[:100]}")
+
+        return False
+
+    except Exception as e:
+        print(f"  [WARMUP] 预热异常: {e}")
+        return False
+
+
+def _execute_login(base_url: str, plan: dict, timeout: int) -> tuple[bool, int, str, str]:
+    """按 LLM 指令执行登录流程。
+
+    Returns:
+        (success, status_code, response_text, error)
+    """
+    login_url = plan.get("login_url", "")
+    if not login_url:
+        return False, 0, "", "无登录 URL"
+
+    # 处理相对 URL
+    if login_url.startswith("/"):
+        login_url = base_url + login_url
+    elif not login_url.startswith("http"):
+        login_url = base_url + "/" + login_url
+
+    fields = plan.get("fields", {})
+    credentials = plan.get("credentials", {})
+    csrf_info = plan.get("csrf_token", {})
+    extra_steps = plan.get("extra_steps", [])
+
+    try:
+        # 执行额外步骤（如先访问某个页面获取 cookie）
+        for step in extra_steps:
+            if step.startswith("GET "):
+                step_url = step[4:].strip()
+                if step_url.startswith("/"):
+                    step_url = base_url + step_url
+                _SESSION.get(step_url, headers=_FALLBACK_HEADERS, timeout=timeout, allow_redirects=False)
+            elif step.startswith("POST "):
+                step_url = step[5:].strip()
+                if step_url.startswith("/"):
+                    step_url = base_url + step_url
+                _SESSION.post(step_url, headers=_FALLBACK_HEADERS, timeout=timeout, allow_redirects=False)
+
+        # 提取 CSRF token（如果需要）
+        csrf_token = ""
+        if csrf_info.get("exists", False):
+            # 先 GET 登录页面
+            login_page_resp = _SESSION.get(login_url, headers=_FALLBACK_HEADERS, timeout=timeout)
+            page_text = login_page_resp.text
+
+            regex = csrf_info.get("regex", "")
+            selector = csrf_info.get("selector", "")
+
+            if regex:
+                match = re.search(regex, page_text)
+                if match:
+                    csrf_token = match.group(1) if match.lastindex else match.group(0)
+            elif selector:
+                # 尝试从 name='xxx' 的 input 中提取
+                match = re.search(
+                    rf"name=['\"]{re.escape(selector)}['\"]\s+value=['\"]([^'\"]+)['\"]",
+                    page_text,
+                )
+                if match:
+                    csrf_token = match.group(1)
+
+        # 构造登录数据
+        username_field = fields.get("username_field", "username")
+        password_field = fields.get("password_field", "password")
+        username = credentials.get("username", "admin")
+        password = credentials.get("password", "password")
+
+        login_data = f"{username_field}={username}&{password_field}={password}"
+        if csrf_token:
+            # 尝试常见的 CSRF 字段名
+            for csrf_field in ["user_token", "csrf_token", "_token", "authenticity_token"]:
+                if csrf_field in str(plan):
+                    login_data += f"&{csrf_field}={csrf_token}"
+                    break
+            else:
+                login_data += f"&user_token={csrf_token}"
+
+        login_data += "&Login=Login&Submit=Submit"
+
+        resp = _SESSION.post(
+            login_url,
+            data=login_data,
             headers={**_FALLBACK_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
             timeout=timeout,
             allow_redirects=False,
         )
 
-        # 3. 设置 security=low（DVWA 安全等级）
-        _SESSION.get(
-            base_url + "/security.php",
-            params={"security": "low", "seclev_submit": "Submit"},
-            headers=_FALLBACK_HEADERS,
-            timeout=timeout,
-            allow_redirects=False,
-        )
+        # 检查登录是否成功
+        verify_feature = plan.get("verify_feature", "")
+        if resp.status_code in (301, 302, 303, 307, 308):
+            # 重定向通常表示登录成功
+            return True, resp.status_code, "", ""
+        elif resp.status_code == 200:
+            if verify_feature and verify_feature in resp.text:
+                return True, resp.status_code, resp.text[:1500], ""
+            elif "logout" in resp.text.lower() or "dashboard" in resp.text.lower():
+                return True, resp.status_code, "", ""
+            else:
+                return False, resp.status_code, resp.text[:1500], "登录后未检测到成功特征"
+        else:
+            return False, resp.status_code, resp.text[:1500], f"HTTP {resp.status_code}"
 
-        _WARMED_HOSTS.add(host_key)
-        return True
-    except Exception:
-        return False
+    except Exception as e:
+        return False, 0, "", str(e)
 
 
 def _prepare_headers(raw_headers: dict | None) -> dict:
@@ -197,6 +308,7 @@ def send_payload(
     inject_tag: str = "{{INJECT}}",
     timeout: int = DEFAULT_TIMEOUT,
     baseline_html: str = "",
+    vuln_type: str = "",
 ) -> dict:
     """
     发送单个 Payload。响应到达后第一时间调用 Parser 提取证据。
@@ -226,9 +338,6 @@ def send_payload(
     }
 
     # 构造请求参数（替换 {{INJECT}}）
-    # POST body: URL 编码 payload，防止 &&、| 等被当作参数分隔符截断。
-    # safe='%' 保留已编码的 %XX 序列（如 %0a 换行注入），防止双重编码。
-    # GET params: requests 库自动编码，此处不预编码。
     req_body = _inject_payload(body, quote(payload, safe='%'), inject_tag) if body else ""
     req_params = {
         k: _inject_payload(v, payload, inject_tag) for k, v in _params.items()
@@ -264,11 +373,15 @@ def send_payload(
             result["text"] = ""
         else:
             full_html = resp.text
-            # 第一时间调用 Parser 提取证据，严禁将完整 HTML 传递给下游
-            evidence = parse_evidence(full_html, baseline_html)
+            # 第一时间调用 Parser 提取证据，传递 vuln_type/payload/elapsed 供 LLM 判定
+            evidence = parse_evidence(
+                full_html, baseline_html,
+                payload=payload, vuln_type=vuln_type,
+                response_time_ms=elapsed * 1000,
+            )
             if evidence:
                 result["evidence"] = evidence
-                result["text"] = evidence  # 下游只看到证据，看不到 HTML
+                result["text"] = evidence
             else:
                 result["evidence"] = None
                 result["text"] = ""
@@ -308,11 +421,7 @@ def send_cmdi_cleanup(
     params: dict | None = None,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> None:
-    """Best-effort 清理 CMDI 测试残留的标记文件。
-
-    每次 CMDI fuzzing 前调用，删除上一轮可能残留的临时文件，
-    防止 ls 输出中出现旧文件导致假阳性。清理失败不影响主流程。
-    """
+    """Best-effort 清理 CMDI 测试残留的标记文件。"""
     for cleanup_payload in _CMDI_CLEANUP_PAYLOADS:
         try:
             send_payload(
@@ -325,7 +434,7 @@ def send_cmdi_cleanup(
                 timeout=timeout,
             )
         except Exception:
-            pass  # Best-effort，被 WAF 拦截也无所谓
+            pass
 
 
 # ============================================================
@@ -342,6 +451,7 @@ def batch_send(
     concurrency: int = 5,
     timeout: int = DEFAULT_TIMEOUT,
     baseline_html: str = "",
+    vuln_type: str = "",
 ) -> list[dict]:
     """
     批量发送 Payload（ThreadPoolExecutor 并发）。
@@ -365,7 +475,8 @@ def batch_send(
                 params,
                 "{{INJECT}}",
                 timeout,
-                baseline_html,  # 传递基线以便 parser 做差异对比
+                baseline_html,
+                vuln_type,
             ): i
             for i, p in enumerate(payloads)
         }
@@ -385,5 +496,4 @@ def batch_send(
                     }
                 )
 
-    # 结果以线程完成顺序返回（调用方按 payload 字符串匹配，不依赖顺序）
     return results

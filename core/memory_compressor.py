@@ -2,20 +2,27 @@
 """
 memory_compressor.py  WAF 规则记忆压缩与知识库管理
 
+【分层架构】
+- config/base_rules.json    — 人工维护的基础规则（agent 只读，代码中无写入函数）
+- output/learned_rules.json — agent 学习的规则（逐轮合并，只在此文件上写入）
+
 【核心职责】
 1. 收集每轮 fuzzing 的 CoT 分析字符串，调用 LLM 压缩为极简 WAF 规则要点（≤200 字）。
-2. 持久化保存到 output/waf_rules_kb.json。
-3. 在后续生成 Payload 时，将历史经验注入系统提示词。
+2. 持久化保存到 output/learned_rules.json（base_rules.json 永不被 agent 写入）。
+3. 在后续生成 Payload 时，将两层历史经验拼接后注入系统提示词。
 """
 
 import functools
 import json
 import os
+import tempfile
 import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
 KB_PATH = os.path.join(PROJECT_DIR, "output", "waf_rules_kb.json")
+BASE_RULES_PATH = os.path.join(PROJECT_DIR, "config", "base_rules.json")
+LEARNED_RULES_PATH = os.path.join(PROJECT_DIR, "output", "learned_rules.json")
 
 _COMPRESS_PROMPT = (
     "你是一名 WAF 规则分析专家。以下是**本轮** {vuln_type_zh} WAF Fuzzing 的 Chain-of-Thought 分析记录。\n\n"
@@ -35,12 +42,33 @@ _COMPRESS_PROMPT = (
 
 
 @functools.lru_cache(maxsize=1)
-def load_kb() -> list[dict]:
-    """加载历史 WAF 规则知识库（LRU 缓存，避免每轮重复读盘）。"""
-    if not os.path.isfile(KB_PATH):
+def load_base_rules() -> list[dict]:
+    """加载人工维护的基础规则（agent 只读，代码中无写入函数）。"""
+    if not os.path.isfile(BASE_RULES_PATH):
         return []
     try:
-        with open(KB_PATH, "r", encoding="utf-8") as f:
+        with open(BASE_RULES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, FileNotFoundError):
+        return []
+
+
+@functools.lru_cache(maxsize=1)
+def load_kb() -> list[dict]:
+    """加载 agent 学习的 WAF 规则（LRU 缓存）。自动从旧文件名迁移。"""
+    # 一次性迁移旧文件名
+    if not os.path.isfile(LEARNED_RULES_PATH) and os.path.isfile(KB_PATH):
+        try:
+            os.rename(KB_PATH, LEARNED_RULES_PATH)
+        except OSError:
+            pass
+
+    path = LEARNED_RULES_PATH if os.path.isfile(LEARNED_RULES_PATH) else KB_PATH
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, list) else []
     except (json.JSONDecodeError, FileNotFoundError):
@@ -53,7 +81,7 @@ def consolidate_kb(vuln_type: str, compressed_rules: str, target_url: str):
     若 KB 中已有该 vuln_type 的旧记录，调用 LLM 将旧规则与新发现整合去重，
     替换为一条完整记录。避免经验碎片化互相矛盾。
     """
-    os.makedirs(os.path.dirname(KB_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(LEARNED_RULES_PATH), exist_ok=True)
     kb = load_kb()
 
     # 查找同 vuln_type 的旧记录
@@ -74,7 +102,8 @@ def consolidate_kb(vuln_type: str, compressed_rules: str, target_url: str):
             if merged:
                 compressed_rules = merged
         except Exception:
-            pass  # LLM 整合失败，直接使用新规则覆盖
+            # LLM 整合失败 → 保留旧规则，追加新发现，避免历史经验丢失
+            compressed_rules = old_entry["rules"] + "；" + compressed_rules
 
         # 移除旧条目
         kb = [e for e in kb if e.get("vuln_type") != vuln_type]
@@ -86,8 +115,21 @@ def consolidate_kb(vuln_type: str, compressed_rules: str, target_url: str):
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
 
-    with open(KB_PATH, "w", encoding="utf-8") as f:
-        json.dump(kb, f, ensure_ascii=False, indent=2)
+    # 原子写入：先写临时文件再 rename，防止崩溃导致文件损坏
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(LEARNED_RULES_PATH), suffix=".tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(kb, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, LEARNED_RULES_PATH)
+    except BaseException:
+        os.close(tmp_fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
     # 清除 load_kb 缓存，确保下次读取的是最新数据
     load_kb.cache_clear()
@@ -108,7 +150,7 @@ def _merge_rules(old_rules: str, new_rules: str, vuln_type: str) -> str:
     try:
         client = _get_client()
         resp = client.chat.completions.create(
-            model="deepseek-v4-flash",
+            model="mimo-v2.5-pro",
             temperature=0.3,
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
@@ -120,36 +162,59 @@ def _merge_rules(old_rules: str, new_rules: str, vuln_type: str) -> str:
 
 
 def get_kb_context(vuln_type: str = "") -> str:
-    """将知识库格式化为可注入 Prompt 的上下文字符串（整合式，每 vuln_type 仅一条）。
+    """将两层知识库格式化为可注入 Prompt 的上下文字符串。
+
+    base_rules（人工维护）在前，learned_rules（agent 学习）在后，
+    同 vuln_type 两层都有条目时直接拼两行，不做跨层合并。
 
     Args:
-        vuln_type: 若指定，仅返回该漏洞类型的 KB 条目；
-                   若为空，返回所有条目（用于终端展示）。
+        vuln_type: 若指定，仅返回该漏洞类型的条目；若为空，返回所有条目。
     """
-    kb = load_kb()
-    if not kb:
-        return ""
+    base = load_base_rules()
+    learned = load_kb()
 
     lines = []
-    for entry in kb:
+
+    # Layer 1: base rules (human-written, read-only)
+    for entry in base:
         vuln = entry.get("vuln_type", "?").upper()
         rules = entry.get("rules", "")
         if not rules:
             continue
-        if vuln_type and entry.get("vuln_type") != vuln_type:
-            continue  # 过滤不匹配的漏洞类型
+        # general 条目始终注入，不受 vuln_type 过滤
+        if vuln_type and entry.get("vuln_type") != vuln_type and entry.get("vuln_type") != "general":
+            continue
+        lines.append(f"- [{vuln}] {rules}")
+
+    # Layer 2: learned rules (agent-written)
+    for entry in learned:
+        vuln = entry.get("vuln_type", "?").upper()
+        rules = entry.get("rules", "")
+        if not rules:
+            continue
+        if vuln_type and entry.get("vuln_type") != vuln_type and entry.get("vuln_type") != "general":
+            continue
         lines.append(f"- [{vuln}] {rules}")
 
     if not lines:
         return ""
 
-    return "## 历史 WAF 拦截经验（已整合去重，请务必参考）：\n" + "\n".join(lines)
+    has_base = any(
+        (not vuln_type or e.get("vuln_type") == vuln_type or e.get("vuln_type") == "general") and e.get("rules")
+        for e in base
+    )
+    if has_base:
+        header = "## WAF 拦截经验（基础规则 + Agent 学习，请务必参考）：\n"
+    else:
+        header = "## 历史 WAF 拦截经验（已整合去重，请务必参考）：\n"
+
+    return header + "\n".join(lines)
 
 
 def compress_cot_analyses(
     cot_entries: list[str],
     vuln_type: str,
-    model: str = "deepseek-v4-pro",
+    model: str = "mimo-v2.5-pro",
 ) -> str:
     """调用 LLM 将 CoT 分析记录压缩为极简 WAF 规则要点。
 
@@ -167,15 +232,25 @@ def compress_cot_analyses(
     from llm_engine import _get_client
 
     # 检查是否有同 vuln_type 的历史记录，有则加入 Prompt 要求整合去重
+    # general 条目始终注入（通用 WAF 绕过思路）
     history_section = ""
+    wanted = {vuln_type, "general"}
+    # 先注入 base_rules（人工维护，不可修改）
+    base = load_base_rules()
+    for entry in base:
+        if entry.get("vuln_type") in wanted and entry.get("rules"):
+            history_section += (
+                "## 基础已验证规则（人工维护，不可修改）：\n"
+                f"{entry['rules']}\n\n"
+            )
+    # 再注入 learned_rules（agent 学习）
     kb = load_kb()
     for entry in kb:
-        if entry.get("vuln_type") == vuln_type and entry.get("rules"):
-            history_section = (
+        if entry.get("vuln_type") in wanted and entry.get("rules"):
+            history_section += (
                 "## 历史已验证经验（必须与新发现整合去重，不要重复已有内容）：\n"
                 f"{entry['rules']}\n\n"
             )
-            break
 
     combined = "\n---\n".join(
         e[:600] for e in cot_entries[-10:]  # 最多取最近 10 条，每条截断 600 字
