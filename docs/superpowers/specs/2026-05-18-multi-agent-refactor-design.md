@@ -82,7 +82,8 @@ waf-fuzzer/
 │   ├── requester.py
 │   ├── response_extractor.py
 │   ├── memory_compressor.py
-│   └── waf_fingerprinter.py       # WAF 指纹识别模块
+│   ├── waf_fingerprinter.py       # WAF 指纹识别模块
+│   └── crawler.py                 # 站点爬取 + 注入点发现
 ├── output/
 └── main.py
 ```
@@ -98,6 +99,16 @@ waf-fuzzer/
 ## 4. 数据结构定义
 
 ```python
+@dataclass
+class InjectionPoint:
+    url: str                        # 注入点 URL
+    param: str                      # 参数名
+    method: str                     # GET / POST
+    vuln_type: str                  # 推断的注入类型: "cmdi" | "sqli" | "log4j"
+    page_hint: str                  # 页面提示文本
+    inferred_context: str           # 推测的后端上下文，如 "ping {input}"
+    closure_chars: list[str]        # 推测的闭合符候选
+
 @dataclass
 class WAFProfile:
     detected: bool                  # 是否检测到 WAF
@@ -262,7 +273,81 @@ class Solver:
 
 ---
 
-## 7. WAF 指纹识别（前置阶段）
+## 7. 注入点发现（Phase 1）
+
+用户只需提供目标入口 URL（如 `http://192.168.1.100:81/`），系统自动发现注入点。
+**不发送探针**（会被 WAF 拦截），纯靠页面上下文推断。
+
+### 7.1 站点爬取
+
+从入口 URL 开始，爬取所有可达页面，提取：
+- 所有表单的 action、method、input 参数名
+- URL 中的查询参数
+- 页面文本（表单标签、提示语、placeholder）
+
+### 7.2 注入类型推断（LLM）
+
+对每个发现的表单/参数，LLM 根据上下文推断注入类型：
+
+```
+LLM 输入：
+  - URL 路径
+  - 参数名
+  - 页面提示文本 / 表单标签
+
+LLM 推断规则：
+  参数名含 ip/host/cmd/command + 提示含"IP地址"/"ping"/"域名"
+    → CMDI，推测后端: ping {input}
+
+  参数名含 id/uid/user/search/query + 提示含"查询"/"搜索"/"用户"
+    → SQLi，推测后端: SELECT ... WHERE id='{input}'
+
+  参数名含 url/uri/callback/jndi + URL 路径含 api/remote/fetch
+    → 可能 Log4j / SSRF，尝试 JNDI 注入
+
+  以上都不匹配
+    → 不在范围内，跳过
+```
+
+### 7.3 筛选范围
+
+只保留三种类型：CMDI、SQLi、Log4j。其他类型（XSS、CSRF、文件上传等）直接跳过。
+
+### 7.4 DVWA 示例
+
+```
+输入: http://192.168.1.100:81/
+
+爬取发现:
+  /vulnerabilities/exec/        参数: ip          提示: "Enter an IP address"
+  /vulnerabilities/sqli/        参数: id, Submit  提示: "User ID"
+  /vulnerabilities/sqli_blind/  参数: id, Submit  提示: "User ID"
+  /vulnerabilities/xss_r/       参数: name        提示: "What's your name?"
+  /vulnerabilities/fi/          参数: page        提示: "File Include"
+  /vulnerabilities/upload/      参数: uploaded
+  /vulnerabilities/brute/       参数: username, password
+  /vulnerabilities/csrf/        参数: password_new, password_conf
+
+LLM 推断:
+  /vulnerabilities/exec/ (ip)      → CMDI ✓（参数名 ip + 输入提示）
+  /vulnerabilities/sqli/ (id)      → SQLi ✓（参数名 id + 查询提示）
+  /vulnerabilities/sqli_blind/ (id)→ SQLi ✓（同上，盲注变体）
+  /vulnerabilities/xss_r/ (name)   → 跳过（XSS 不在范围）
+  /vulnerabilities/fi/ (page)      → 跳过（LFI 不在范围）
+  其余                             → 跳过
+
+筛选结果: 3 个注入点进入下一阶段
+```
+
+### 7.5 同主机优化
+
+多个注入点在同一 host:port 时：
+- WAF 指纹识别只执行一次（同 WAF）
+- 每个注入点独立执行注入点验证和 Fuzzing 循环
+
+---
+
+## 8. WAF 指纹识别（Phase 2）
 
 在 Fuzzing 循环开始前，Manager 先调用 WAF Fingerprinter 对目标进行指纹识别。
 **如果没有检测到 WAF，跳过整个 Fuzzing 流程**（没有 WAF 就没有绕过的意义）。
@@ -639,51 +724,64 @@ def main():
     manager = Manager(config, kb)
     solver = Solver()
     observer = Observer()
-    fingerprinter = WAFFingerprinter()  # 新增
+    fingerprinter = WAFFingerprinter()
+    crawler = SiteCrawler()  # 新增
 
-    for target in manager.select_targets():
-        # Phase 1: 基线采集
-        baseline = manager.collect_baseline(target)
+    for entry_url in config.entry_urls:
+        # Phase 1: 注入点发现
+        candidates = crawler.crawl(entry_url)
+        injection_points = manager.infer_injection_types(candidates)
+        # 筛选 CMDI / SQLi / Log4j
+        injection_points = [p for p in injection_points if p.vuln_type in ("cmdi", "sqli", "log4j")]
 
-        # Phase 2: WAF 指纹识别（新增）
-        waf_profile = fingerprinter.fingerprint(target)
-        if not waf_profile.detected:
-            print(f"[!] 目标 {target.url} 未检测到 WAF，跳过绕过测试")
-            manager.generate_report(target, waf_profile=waf_profile, skip_fuzzing=True)
+        if not injection_points:
+            print(f"[!] {entry_url} 未发现 CMDI/SQLi/Log4j 注入点，跳过")
             continue
 
-        print(f"[+] 检测到 WAF: {waf_profile.waf_name} (confidence: {waf_profile.confidence})")
+        print(f"[+] 发现 {len(injection_points)} 个注入点:")
+        for p in injection_points:
+            print(f"    {p.url} ({p.param}) → {p.vuln_type}")
 
-        # Phase 2.5: 攻击面分析（新增）
-        attack_plan = manager.analyze_attack_surface(target, waf_profile)
-        print(f"[*] 首攻维度: {attack_plan.dimension_priority[0]}")
-        print(f"[*] 策略: {attack_plan.first_round_strategy}")
+        # Phase 2: WAF 指纹识别（同主机只做一次）
+        waf_profile = fingerprinter.fingerprint(injection_points[0])
+        if not waf_profile.detected:
+            print(f"[!] 目标无 WAF 防护，跳过绕过测试")
+            continue
 
-        # Phase 3: Fuzzing 循环
-        for round_num in range(config.max_iterations):
-            decision = manager.decide_strategy(target, round_num, waf_profile, attack_plan)
+        print(f"[+] 检测到 WAF: {waf_profile.waf_name}")
 
-            solver_req = SolverRequest(
-                target=target, strategy=decision.strategy,
-                dimension=decision.dimension, kb_context=kb.get_context(),
-                round_num=round_num, blocked_payloads=manager.blocked_history,
-                waf_profile=waf_profile,  # 传入 WAF 指纹
-            )
-            responses = solver.solve(solver_req)
+        # Phase 3-4: 对每个注入点执行绕过测试
+        for point in injection_points:
+            # Phase 3: 基线采集 + 攻击面分析
+            baseline = manager.collect_baseline(point)
+            attack_plan = manager.analyze_attack_surface(point, waf_profile)
 
-            obs_req = ObserverRequest(
-                responses=responses, baseline_html=baseline,
-                vuln_type=target.vuln_type
-            )
-            result = observer.evaluate(obs_req)
+            # Phase 4: Fuzzing 循环
+            for round_num in range(config.max_iterations):
+                decision = manager.decide_strategy(point, round_num, waf_profile, attack_plan)
 
-            manager.record_round(target, decision, result)
-            manager.update_kb(target, decision, result)
+                solver_req = SolverRequest(
+                    target=point, strategy=decision.strategy,
+                    dimension=decision.dimension, kb_context=kb.get_context(),
+                    round_num=round_num, blocked_payloads=manager.blocked_history,
+                    waf_profile=waf_profile,
+                )
+                responses = solver.solve(solver_req)
 
-            if manager.should_stop(target):
-                break
+                obs_req = ObserverRequest(
+                    responses=responses, baseline_html=baseline,
+                    vuln_type=point.vuln_type
+                )
+                result = observer.evaluate(obs_req)
 
-        manager.generate_report(target, waf_profile=waf_profile)
+                manager.record_round(point, decision, result)
+                manager.update_kb(point, decision, result)
+
+                if manager.should_stop(point):
+                    break
+
+    # Phase 5: 汇总报告
+    manager.generate_final_report()
 ```
 
 ---
@@ -693,8 +791,18 @@ def main():
 `config/target.yaml` 新增字段：
 
 ```yaml
+llm:
+  provider: "openai"
+  api_key: "sk-xxx"
+  model: "mimo-v2.5-pro"
+  base_url: "https://token-plan-cn.xiaomimimimo.com/v1"
+
 fuzzing:
-  # 现有字段不变
+  max_iterations: 20
+  batch_size: 5
+  concurrency: 5
+  request_timeout: 15
+  early_stop_on_all_blocked: 5
   solver_dimensions:
     - protocol
     - performance
@@ -704,14 +812,25 @@ fuzzing:
   perf_padding_size: 102400
   perf_concurrency: 50
 
-# 新增：OOB 回调服务器配置（Log4j / 反序列化检测用）
+# OOB 回调服务器配置（Log4j / 反序列化检测用）
 oob:
-  server: "oob.example.com"           # 回调服务器域名
-  poll_api: "https://oob.example.com/api/poll"  # 轮询 API
-  api_key: ""                         # 认证密钥（可选）
-  poll_interval_ms: 2000              # 轮询间隔（毫秒）
-  poll_timeout_ms: 30000              # 最大等待时间（毫秒）
-```
+  server: "oob.example.com"
+  poll_api: "https://oob.example.com/api/poll"
+  api_key: ""
+  poll_interval_ms: 2000
+  poll_timeout_ms: 30000
+
+# 目标入口 URL（系统自动发现注入点，不再手动指定 vuln_type）
+entry_urls:
+  - "http://192.168.1.100:81/"        # DVWA，自动发现 exec/sqli/sqli_blind
+  - "http://192.168.1.200/"           # 其他靶场，自动爬取+推断
+
+# 旧格式（已废弃）：
+# targets:
+#   - url: "http://..."
+#     method: POST
+#     vuln_type: cmdi
+#     body: "ip={{INJECT}}"
 
 ---
 
@@ -731,6 +850,8 @@ oob:
 | `response_extractor.py` | → `core/response_extractor.py` | 保持为独立工具 |
 | （新增）WAF 指纹识别 | → `core/waf_fingerprinter.py` | 前置阶段：检测 WAF 并识别厂商 |
 | （新增）WAF 指纹库 | → `config/waf_signatures.json` | 人工维护的 WAF 特征库 |
+| （新增）站点爬取 | → `core/crawler.py` | 爬取入口 URL，提取表单/参数/页面文本 |
+| （新增）注入点推断 | → `agents/manager.py` 内部 | LLM 从上下文推断注入类型（CMDI/SQLi/Log4j） |
 
 ---
 
