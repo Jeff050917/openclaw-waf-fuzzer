@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """
+DEPRECATED: 此文件已被 main.py + agents/ 替代。
+保留仅为向后兼容。新代码请使用 agents/manager.py, agents/solver.py, agents/observer.py。
+
 workflow.py  主调度器
 
 【核心职责】
@@ -12,6 +15,8 @@ workflow.py  主调度器
 4. 每轮即时压缩 CoT 分析，逐轮更新 WAF 规则知识库。
 5. 控制循环终止条件，将成功 Bypass 的 Payload 落盘。
 """
+import warnings
+warnings.warn("workflow.py is deprecated. Use main.py instead.", DeprecationWarning, stacklevel=2)
 
 import io
 import json

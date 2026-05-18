@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 """
+DEPRECATED: 此文件已被 agents/observer.py 替代。
+证据提取和判定逻辑已迁入 Observer Agent 的 Judge 类。
+保留仅为向后兼容。新代码请使用 agents/observer.py。
+
 inline_parser.py  响应即时解析器
 
 【核心职责】
@@ -8,6 +12,8 @@ inline_parser.py  响应即时解析器
 3. CMDI：硬编码正则证据校验（零 Token）。
 4. SQLi：交 LLM 综合判断（消耗 Token，仅在有增量回显或延时时触发）。
 """
+import warnings
+warnings.warn("inline_parser.py is deprecated. Use agents/observer.py instead.", DeprecationWarning, stacklevel=2)
 
 import html as _html_mod
 import re
