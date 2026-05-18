@@ -3,10 +3,10 @@ from __future__ import annotations
 from agents.models import SolverRequest, RawResponse
 from agents.solver_engines.base import SolverEngine
 from agents.solver_engines.semantic import SemanticSolver
+from agents.solver_engines.performance import PerfSolver
 
 # Other engines will be added in Tasks 8-10
 # from agents.solver_engines.protocol import ProtocolSolver
-# from agents.solver_engines.performance import PerfSolver
 # from agents.solver_engines.topology import TopologySolver
 
 
@@ -15,7 +15,7 @@ class Solver:
         self._engines: dict[str, SolverEngine] = {
             "semantic": SemanticSolver(concurrency=concurrency, timeout=timeout, model=model),
             # "protocol": ProtocolSolver(...),
-            # "performance": PerfSolver(...),
+            "performance": PerfSolver(concurrency=concurrency, timeout=timeout, model=model),
             # "topology": TopologySolver(...),
         }
 
