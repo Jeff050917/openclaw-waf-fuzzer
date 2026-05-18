@@ -3,20 +3,18 @@ from __future__ import annotations
 from agents.models import SolverRequest, RawResponse
 from agents.solver_engines.base import SolverEngine
 from agents.solver_engines.semantic import SemanticSolver
+from agents.solver_engines.protocol import ProtocolSolver
 from agents.solver_engines.performance import PerfSolver
-
-# Other engines will be added in Tasks 8-10
-# from agents.solver_engines.protocol import ProtocolSolver
-# from agents.solver_engines.topology import TopologySolver
+from agents.solver_engines.topology import TopologySolver
 
 
 class Solver:
     def __init__(self, concurrency: int = 5, timeout: int = 15, model: str = "mimo-v2.5-pro"):
         self._engines: dict[str, SolverEngine] = {
             "semantic": SemanticSolver(concurrency=concurrency, timeout=timeout, model=model),
-            # "protocol": ProtocolSolver(...),
+            "protocol": ProtocolSolver(concurrency=concurrency, timeout=timeout, model=model),
             "performance": PerfSolver(concurrency=concurrency, timeout=timeout, model=model),
-            # "topology": TopologySolver(...),
+            "topology": TopologySolver(timeout=timeout, model=model),
         }
 
     def solve(self, request: SolverRequest) -> list[RawResponse]:
