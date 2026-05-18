@@ -8,6 +8,7 @@ config/target.yaml
 config/*.yml
 config/*.json
 !config/base_rules.json
+!config/waf_signatures.json
 .env
 output/
 *.log
