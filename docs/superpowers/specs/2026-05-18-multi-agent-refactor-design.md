@@ -109,6 +109,13 @@ class WAFProfile:
     bypass_tips: list[str]          # 该 WAF 已知绕过提示（从 waf_signatures.json 读取）
 
 @dataclass
+class AttackPlan:
+    dimension_priority: list[str]       # 维度优先级排序，如 ["protocol", "semantic", ...]
+    first_round_strategy: str           # 首轮策略描述
+    predicted_blocking: str             # 预判拦截模式
+    reasoning: str                      # 分析理由
+
+@dataclass
 class SolverRequest:
     target: TargetConfig
     strategy: str                   # Manager LLM 决策的策略方向（自然语言）
@@ -278,9 +285,27 @@ Manager Phase 2: WAF 指纹识别
   │      - 响应体中出现拦截页面特征
   │      - 响应头新增 WAF 标识
   │
-  ├── 3. 与 config/waf_signatures.json 指纹库比对
+  ├── 3. 与 config/waf_signatures.json 指纹库比对 → 命中特征列表
   │
-  └── 4. 输出 WAFProfile
+  ├── 4. LLM 辅助分析（新增）
+  │      │
+  │      │  输入：
+  │      │    - 正常响应的 headers + body 摘要
+  │      │    - 探测 payload 的响应 headers + body 摘要
+  │      │    - 指纹库命中结果（可能为空或多个）
+  │      │
+  │      │  LLM 做三件事：
+  │      │    a. 指纹库未命中时：从响应特征推断可能的 WAF 类型
+  │      │       （自建 WAF、小众 WAF、云厂商定制 WAF）
+  │      │    b. 指纹库命中多个时：排除误报，确认最可能的 WAF
+  │      │    c. 识别 WAF 版本/配置特征：
+  │      │       - 规则严格度（宽松/严格）
+  │      │       - 检测引擎类型（正则/语义/机器学习）
+  │      │       - 是否有学习模式/例外规则
+  │      │
+  │      └── 输出：修正后的 WAFProfile + 补充 bypass_tips
+  │
+  └── 5. 输出最终 WAFProfile
 ```
 
 ### 7.2 检测方法（按优先级）
@@ -390,7 +415,52 @@ Manager Phase 2: WAF 指纹识别
 - 可选：直接发送标准 payload 验证漏洞是否存在（不绕过，只验证）
 - 跳过 Fuzzing 循环，直接生成报告
 
-### 7.5 WAFProfile 在系统中的流转
+### 7.5 识别到 WAF 后：攻击面分析（新增）
+
+识别到 WAF 后，**不是直接进入 Fuzzing**，而是先由 Manager LLM 做一次攻击面分析，
+确定首攻方向和优先级，再进入循环。
+
+```
+Phase 2.5: Manager LLM 攻击面分析
+  │
+  │  输入：
+  │    - WAFProfile（WAF 名称、厂商、特征、bypass_tips）
+  │    - target 信息（URL、vuln_type、headers、params）
+  │    - kb_context（base_rules + learned_rules）
+  │    - 可用 solver_dimensions 列表
+  │
+  │  LLM 分析（一次性，非每轮）：
+  │
+  │    1. WAF 弱点分析：
+  │       "Cloudflare 对 JSON body 解析较弱，协议层绕过优先"
+  │       "ModSecurity CRS 基于正则，语义层等价函数替换优先"
+  │       "未知 WAF，先从语义层探测，观察拦截模式再切换"
+  │
+  │    2. 首攻维度选择（带优先级排序）：
+  │       dimension_priority: ["protocol", "semantic", "performance", "topology"]
+  │       理由：该 WAF 对协议层畸形请求的检测最弱
+  │
+  │    3. 首轮策略：
+  │       "先用 HPP + 双重编码测试协议层解析差异，
+  │        如果全部被拦截则切换到语义层冷门函数替换"
+  │
+  │    4. 预判拦截模式：
+  │       "该 WAF 大概率拦截 UNION SELECT 关键字，
+  │        但对 %55NION 这类编码变体可能放行"
+  │
+  └──  输出：AttackPlan
+       ├── dimension_priority: list[str]    # 维度优先级排序
+       ├── first_round_strategy: str        # 首轮策略描述
+       ├── predicted_blocking: str          # 预判拦截模式
+       └── reasoning: str                   # 分析理由（写入报告）
+```
+
+**关键区别**：
+- 之前的 Manager LLM 决策是**每轮一次**，无历史上下文
+- 攻击面分析是**一次性**，基于 WAF 指纹做全局规划
+- 后续每轮的 Manager LLM 决策会在 AttackPlan 基础上微调，而非从零开始
+
+### 7.6 WAFProfile 在系统中的流转
 
 ```
 WAF Fingerprinter → WAFProfile
@@ -584,9 +654,14 @@ def main():
 
         print(f"[+] 检测到 WAF: {waf_profile.waf_name} (confidence: {waf_profile.confidence})")
 
+        # Phase 2.5: 攻击面分析（新增）
+        attack_plan = manager.analyze_attack_surface(target, waf_profile)
+        print(f"[*] 首攻维度: {attack_plan.dimension_priority[0]}")
+        print(f"[*] 策略: {attack_plan.first_round_strategy}")
+
         # Phase 3: Fuzzing 循环
         for round_num in range(config.max_iterations):
-            decision = manager.decide_strategy(target, round_num, waf_profile)
+            decision = manager.decide_strategy(target, round_num, waf_profile, attack_plan)
 
             solver_req = SolverRequest(
                 target=target, strategy=decision.strategy,
