@@ -80,7 +80,7 @@ waf-fuzzer/
 │       └── topology.py
 ├── core/
 │   ├── requester.py
-│   ├── response_extractor.py
+│   ├── (response_extractor.py 已删除，功能归入 agents/observer.py)
 │   ├── memory_compressor.py
 │   ├── waf_fingerprinter.py       # WAF 指纹识别模块
 │   └── crawler.py                 # 站点爬取 + 注入点发现
@@ -847,7 +847,7 @@ entry_urls:
 | `requester.py` | → `core/requester.py` | 共享工具，被 Solver 调用 |
 | `baseliner.py` | → `manager.py` 内部 | 基线采集归 Manager |
 | `memory_compressor.py` | → `core/memory_compressor.py` | 共享工具，被 Manager 调用 |
-| `response_extractor.py` | → `core/response_extractor.py` | 保持为独立工具 |
+| `response_extractor.py` | 已删除 | 功能归入 `agents/observer.py` |
 | （新增）WAF 指纹识别 | → `core/waf_fingerprinter.py` | 前置阶段：检测 WAF 并识别厂商 |
 | （新增）WAF 指纹库 | → `config/waf_signatures.json` | 人工维护的 WAF 特征库 |
 | （新增）站点爬取 | → `core/crawler.py` | 爬取入口 URL，提取表单/参数/页面文本 |

@@ -2197,9 +2197,9 @@ git commit -m "feat: add TopologySolver engine for architecture-level bypass"
 **Files:**
 - Modify: `core/workflow.py` (保留为兼容入口，标记 deprecated)
 - Modify: `core/inline_parser.py` (标记 deprecated，逻辑已迁入 Observer)
-- Note: `core/response_extractor.py` 保持不变（独立工具，被 Observer 可选调用）
+- Note: `core/response_extractor.py` 已删除（功能归入 `agents/observer.py`）
 
-**说明:** 旧 `workflow.py` 和 `inline_parser.py` 保留但标记 deprecated。`requester.py` 清理为纯 HTTP 工具，移除对 `inline_parser` 的直接依赖（Observer 接管判定职责）。`response_extractor.py` 保持为独立工具，不做修改。
+**说明:** 旧 `workflow.py` 和 `inline_parser.py` 保留但标记 deprecated。`requester.py` 清理为纯 HTTP 工具，移除对 `inline_parser` 的直接依赖（Observer 接管判定职责）。`response_extractor.py` 已删除，其功能被 `agents/observer.py` 完全覆盖。
 
 - [ ] **Step 1: 在 workflow.py 顶部添加 deprecated 标记**
 

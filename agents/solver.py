@@ -14,7 +14,7 @@ class Solver:
             "semantic": SemanticSolver(concurrency=concurrency, timeout=timeout, model=model),
             "protocol": ProtocolSolver(concurrency=concurrency, timeout=timeout, model=model),
             "performance": PerfSolver(concurrency=concurrency, timeout=timeout, model=model),
-            "topology": TopologySolver(timeout=timeout, model=model),
+            "topology": TopologySolver(concurrency=concurrency, timeout=timeout, model=model),
         }
 
     def solve(self, request: SolverRequest) -> list[RawResponse]:

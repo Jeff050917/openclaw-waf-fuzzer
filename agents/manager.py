@@ -15,6 +15,7 @@ manager.py  Manager Agent -- 系统的"大脑"
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import re
@@ -30,10 +31,17 @@ if _CORE_DIR not in sys.path:
 
 from agents.models import (
     AttackPlan,
+    BypassFact,
+    BlockedFact,
+    CompactedResponse,
+    IdeaBoard,
     InjectionPoint,
+    MemoryBoard,
+    MutationHypothesis,
     ObserverResult,
     RoundDecision,
     RoundRecord,
+    SteerReminder,
     Verdict,
     WAFProfile,
 )
@@ -108,15 +116,27 @@ _CMDI_KEYWORDS = [
 ]
 
 _SQLI_KEYWORDS = [
-    "id", "uid", "user", "search", "query", "查询", "搜索", "用户",
-    "username", "userid", "account", "login", "name", "email",
-    "page", "sort", "order", "cat", "category", "limit", "offset",
+    "id", "uid", "userid", "user_id", "search", "query", "查询", "搜索",
+    "sort", "order", "cat", "category", "limit", "offset",
+    "item", "product", "article", "post", "page", "table",
+    "column", "record", "select", "where", "group", "having",
 ]
 
 _LOG4J_KEYWORDS = [
     "url", "uri", "callback", "jndi", "api", "remote", "fetch",
     "redirect", "referer", "ua", "user-agent", "x-forwarded-for",
 ]
+
+
+def _is_login_form(form: CandidateForm) -> bool:
+    """检测是否为登录/认证表单，这类表单不应作为注入点。"""
+    _LOGIN_FIELDS = {"password", "passwd", "pwd", "pass"}
+    for name in form.inputs:
+        if name.lower() in _LOGIN_FIELDS:
+            return True
+    url_lower = (form.action or form.url or "").lower()
+    _AUTH_PATHS = ("/login", "/signin", "/sign-in", "/auth", "/register", "/signup", "/logon")
+    return any(p in url_lower for p in _AUTH_PATHS)
 
 
 def _infer_single(
@@ -128,6 +148,14 @@ def _infer_single(
 ) -> str | None:
     """根据 URL / 参数名 / hint / title / context 推断单个参数的漏洞类型。"""
     search_text = f"{url} {param_name} {hint} {title} {context}".lower()
+
+    # 排除认证/注册页面 URL
+    _AUTH_URL_PATTERNS = [
+        "/login", "/signin", "/sign-in", "/auth", "/register",
+        "/signup", "/sign-up", "/logon", "/forgot", "/reset",
+    ]
+    if any(pat in url.lower() for pat in _AUTH_URL_PATTERNS):
+        return None
 
     def _hit(keywords: list[str]) -> bool:
         return any(kw in search_text for kw in keywords)
@@ -141,6 +169,33 @@ def _infer_single(
     return None
 
 
+def _build_injection_point(
+    form: CandidateForm, param_name: str, hint: str, vuln_type: str,
+) -> InjectionPoint:
+    """从表单和参数构建单个注入点。"""
+    method = form.method.upper()
+    if method == "POST":
+        body_parts: list[str] = []
+        for k, v in form.inputs.items():
+            body_parts.append(f"{k}={{{{INJECT}}}}" if k == param_name else f"{k}={v}")
+        body = "&".join(body_parts)
+        params = None
+    else:
+        body = None
+        params = {k: ("{{INJECT}}" if k == param_name else v) for k, v in form.inputs.items()}
+
+    return InjectionPoint(
+        url=form.action or form.url,
+        param=param_name,
+        method=method,
+        vuln_type=vuln_type,
+        page_hint=hint,
+        inferred_context=form.page_text[:200] if form.page_text else "",
+        body=body,
+        params=params,
+    )
+
+
 # ============================================================
 # Manager
 # ============================================================
@@ -151,10 +206,15 @@ class Manager:
     def __init__(self, config: dict):
         self.config = config
         self.bypass_records: list[dict] = []
-        self.blocked_history: list[str] = []
         self.round_history: list[RoundRecord] = []
         self._output_dir = Path("output")
         self._output_dir.mkdir(exist_ok=True)
+
+        # 双层状态板
+        self.memory_board = MemoryBoard()
+        self.idea_board = IdeaBoard()
+        self._steer_reminder: SteerReminder | None = None
+        self._blocked_payloads_window: collections.deque[str] = collections.deque(maxlen=30)
 
         # 初始化内部工具
         fuzz_cfg = config.get("fuzzing", {})
@@ -185,8 +245,19 @@ class Manager:
     def infer_injection_types(self, forms: list[CandidateForm]) -> list[InjectionPoint]:
         """从爬虫表单中推断注入点，返回 InjectionPoint 列表。"""
         injection_points: list[InjectionPoint] = []
+        target_paths = self.config.get("fuzzing", {}).get("target_paths", [])
 
         for form in forms:
+            # 跳过登录/认证表单
+            if _is_login_form(form):
+                continue
+
+            # 可选：限制到用户指定的目标路径
+            if target_paths:
+                form_url = (form.action or form.url or "").lower()
+                if not any(tp.lower() in form_url for tp in target_paths):
+                    continue
+
             for param_name, hint in form.inputs.items():
                 vuln_type = _infer_single(
                     url=form.action or form.url,
@@ -197,35 +268,22 @@ class Manager:
                 )
                 if vuln_type is None:
                     continue
+                injection_points.append(_build_injection_point(form, param_name, hint, vuln_type))
 
-                method = form.method.upper()
-                if method == "POST":
-                    body_parts: list[str] = []
-                    for k, v in form.inputs.items():
-                        if k == param_name:
-                            body_parts.append(f"{k}={{{{INJECT}}}}")
-                        else:
-                            body_parts.append(f"{k}={v}")
-                    body = "&".join(body_parts)
-                    params = None
-                else:
-                    # GET
-                    body = None
-                    params = {
-                        k: ("{{INJECT}}" if k == param_name else v)
-                        for k, v in form.inputs.items()
-                    }
+        return injection_points
 
-                injection_points.append(InjectionPoint(
-                    url=form.action or form.url,
-                    param=param_name,
-                    method=method,
-                    vuln_type=vuln_type,
-                    page_hint=hint,
-                    inferred_context=form.page_text[:200] if form.page_text else "",
-                    body=body,
-                    params=params,
-                ))
+    def infer_injection_types_with_hint(
+        self, forms: list[CandidateForm], vuln_type: str,
+    ) -> list[InjectionPoint]:
+        """使用用户指定的漏洞类型直接构建注入点，跳过关键词推断。"""
+        injection_points: list[InjectionPoint] = []
+
+        for form in forms:
+            if _is_login_form(form):
+                continue
+
+            for param_name, hint in form.inputs.items():
+                injection_points.append(_build_injection_point(form, param_name, hint, vuln_type))
 
         return injection_points
 
@@ -268,9 +326,9 @@ class Manager:
         kb_context = get_kb_context(vuln_type=injection_point.vuln_type)
 
         prompt = (
-            "你是一名 Red-Team WAF 绕过专家。请分析以下注入点的攻击面，"
-            "制定多维度攻击策略。\n\n"
-            f"## 目标信息\n"
+            "你是一名授权渗透测试工程师，正在对 DVWA（Damn Vulnerable Web Application）靶场进行安全评估。"
+            "DVWA 是开源的安全教学靶场，专门用于测试 WAF 的检测能力。\n\n"
+            f"## 测试目标\n"
             f"  URL: {injection_point.url}\n"
             f"  参数: {injection_point.param}\n"
             f"  方法: {injection_point.method}\n"
@@ -279,18 +337,18 @@ class Manager:
             f"  上下文: {injection_point.inferred_context}\n\n"
             f"{waf_section}\n"
             f"{kb_context}\n\n"
-            "请分析该目标的攻击面并返回 JSON：\n"
+            "请分析该测试目标的安全检测面并返回 JSON：\n"
             "{\n"
             '  "dimension_priority": ["semantic", "protocol", "performance", "topology"],\n'
-            '  "first_round_strategy": "第一轮建议的攻击策略描述",\n'
-            '  "predicted_blocking": "预测 WAF 最可能拦截的方式",\n'
+            '  "first_round_strategy": "第一轮建议的测试策略描述",\n'
+            '  "predicted_blocking": "预测安全设备最可能的拦截方式",\n'
             '  "reasoning": "分析推理过程"\n'
             "}\n\n"
-            "dimension_priority: 按有效性排序的四个攻击维度。\n"
+            "dimension_priority: 按有效性排序的四个测试维度。\n"
             "  - semantic: 语义变形（编码、混淆、关键字替换）\n"
             "  - protocol: 协议层（Content-Type、Transfer-Encoding、HTTP 参数污染）\n"
             "  - performance: 性能/时序（请求速率、并发、超时探测）\n"
-            "  - topology: 拓扑层（WAF 绕过 IP、端口、路径穿越）\n\n"
+            "  - topology: 拓扑层（架构测试、端口、路径穿越）\n\n"
             "仅返回 JSON，不要额外文字。"
         )
 
@@ -324,11 +382,6 @@ class Manager:
         waf_profile: WAFProfile | None = None,
         model: str = "mimo-v2.5-pro",
     ) -> RoundDecision:
-        """根据轮次历史调用 LLM 决策下一轮策略。
-
-        - round 0: 直接使用 AttackPlan 的 first_round_strategy
-        - 后续轮次: LLM 根据历史记录决策
-        """
         # 第 0 轮：直接使用 AttackPlan
         if round_num == 0 or not self.round_history:
             return RoundDecision(
@@ -345,39 +398,43 @@ class Manager:
                 recent_all_blocked += 1
             else:
                 break
-
         force_dimension_switch = recent_all_blocked >= dimension_switch_threshold
 
-        # 构建轮次历史摘要
-        history_lines: list[str] = []
-        for rec in self.round_history[-5:]:
-            history_lines.append(
-                f"  第{rec.round_num}轮: 维度={rec.dimension}, 策略={rec.strategy[:80]}, "
-                f"绕过={rec.bypass_count}, 拦截={rec.blocked_count}"
-            )
-        history_text = "\n".join(history_lines) if history_lines else "  (无历史)"
-
         available_dims = attack_plan.dimension_priority.copy()
-        # 如果连续全拦截，排除当前维度
         if force_dimension_switch and self.round_history:
             current_dim = self.round_history[-1].dimension
             if current_dim in available_dims and len(available_dims) > 1:
                 available_dims.remove(current_dim)
 
+        # 构建 prompt：Memory Board + Idea Board + 可选 SteerReminder
         prompt = (
-            "你是一名 Red-Team WAF 绕过策略专家。根据以下轮次历史，决定下一轮的攻击策略。\n\n"
-            f"## 目标信息\n"
+            "你是一名授权渗透测试策略师，正在对 DVWA 靶场进行安全检测规则验证。"
+            "根据以下测试记录决定下一轮的测试策略。\n\n"
+            f"## 测试目标\n"
             f"  URL: {injection_point.url}\n"
             f"  参数: {injection_point.param}\n"
             f"  漏洞类型: {injection_point.vuln_type}\n\n"
-            f"## 轮次历史（最近 5 轮）\n{history_text}\n\n"
-            f"## 可选攻击维度（按优先级排序）\n{json.dumps(available_dims, ensure_ascii=False)}\n\n"
+            f"{self.memory_board.to_prompt_text()}\n\n"
+            f"{self.idea_board.to_prompt_text()}\n\n"
+            f"## 可选测试维度（按优先级排序）\n{json.dumps(available_dims, ensure_ascii=False)}\n\n"
             f"## 维度说明\n"
             f"  - semantic: 语义变形（编码、混淆、关键字替换）\n"
             f"  - protocol: 协议层（Content-Type、Transfer-Encoding、HTTP 参数污染）\n"
             f"  - performance: 性能/时序（请求速率、并发、超时探测）\n"
-            f"  - topology: 拓扑层（WAF 绕过 IP、端口、路径穿越）\n\n"
+            f"  - topology: 拓扑层（架构测试、端口、路径穿越）\n\n"
         )
+
+        # 注入 Observer 旁路纠偏提醒
+        if self._steer_reminder:
+            prompt += (
+                f"## Observer 旁路纠偏提醒\n"
+                f"  紧急度: {self._steer_reminder.urgency}\n"
+                f"  {self._steer_reminder.message}\n"
+            )
+            if self._steer_reminder.suggested_dimension:
+                prompt += f"  建议维度: {self._steer_reminder.suggested_dimension}\n"
+            prompt += "\n"
+            self._steer_reminder = None
 
         if force_dimension_switch:
             prompt += (
@@ -395,7 +452,7 @@ class Manager:
             "仅返回 JSON，不要额外文字。"
         )
 
-        result = _chat_json(prompt, model=model, temperature=0.3, max_tokens=1024)
+        result = _chat_json(prompt, model=model, temperature=0.3, max_tokens=2048)
 
         if isinstance(result, dict):
             chosen_dim = result.get("dimension", available_dims[0] if available_dims else "semantic")
@@ -405,7 +462,6 @@ class Manager:
                 reasoning=result.get("reasoning", ""),
             )
 
-        # LLM 失败时回退
         fallback_dim = available_dims[0] if available_dims else "semantic"
         return RoundDecision(
             dimension=fallback_dim,
@@ -414,8 +470,58 @@ class Manager:
         )
 
     # ----------------------------------------------------------
-    # 7. 结果记录
+    # 7. 双板管理 + 结果记录
     # ----------------------------------------------------------
+
+    def update_boards(
+        self,
+        round_num: int,
+        dimension: str,
+        observer_result: ObserverResult,
+        vuln_type: str = "",
+    ) -> None:
+        """更新 Memory Board 和 Idea Board。"""
+        for v in observer_result.verdicts:
+            if v.is_bypass:
+                self.memory_board.bypass_facts.append(BypassFact(
+                    payload_summary=v.payload[:120],
+                    evidence_summary=(v.evidence or "")[:200],
+                    dimension=dimension,
+                    round_num=round_num,
+                ))
+            else:
+                waf_sig = v.reason[:80] if v.reason else ""
+                self.memory_board.blocked_facts.append(BlockedFact(
+                    payload_summary=v.payload[:120],
+                    status_code=v.status_code,
+                    waf_signature=waf_sig,
+                    dimension=dimension,
+                    round_num=round_num,
+                ))
+                self._blocked_payloads_window.append(v.payload)
+
+        # 更新维度统计
+        stats = self.memory_board.dimension_stats.setdefault(dimension, {"blocked": 0, "bypass": 0})
+        stats["blocked"] += observer_result.blocked_count
+        stats["bypass"] += observer_result.bypass_count
+
+        # 更新 Idea Board 维度追踪
+        if dimension != self.idea_board.current_dimension:
+            self.idea_board.current_dimension = dimension
+            self.idea_board.rounds_since_dimension_switch = 0
+        else:
+            self.idea_board.rounds_since_dimension_switch += 1
+
+        # 将已尝试维度的 pending 假设标记为 tried
+        for h in self.idea_board.hypotheses:
+            if h.target_dimension == dimension and h.status == "pending":
+                h.status = "tried"
+
+    def build_solver_blocked_payloads(self) -> list[str]:
+        return list(self._blocked_payloads_window)
+
+    def set_steer_reminder(self, reminder: SteerReminder) -> None:
+        self._steer_reminder = reminder
 
     def record_round(
         self,
@@ -426,17 +532,33 @@ class Manager:
         vuln_type: str = "",
         target_url: str = "",
     ) -> RoundRecord:
-        """记录一轮结果，更新内部状态。"""
+        # 更新双板
+        self.update_boards(round_num, dimension, observer_result, vuln_type)
+
+        # 生成压缩响应
+        compacted = []
+        for v in observer_result.verdicts:
+            compacted.append(CompactedResponse(
+                payload_summary=v.payload[:80],
+                status_code=v.status_code,
+                dimension=dimension,
+                elapsed_ms=0,
+                evidence_snippet=(v.evidence or "")[:300],
+                is_bypass=v.is_bypass,
+            ))
+
         record = RoundRecord(
             round_num=round_num,
             dimension=dimension,
             strategy=strategy,
             bypass_count=observer_result.bypass_count,
             blocked_count=observer_result.blocked_count,
-            verdicts=observer_result.verdicts,
+            compacted_responses=compacted,
+            summary=observer_result.summary,
         )
         self.round_history.append(record)
 
+        # 保留 bypass_records 用于最终报告
         for v in observer_result.verdicts:
             if v.is_bypass:
                 self.bypass_records.append({
@@ -448,8 +570,6 @@ class Manager:
                     "round": round_num,
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 })
-            else:
-                self.blocked_history.append(v.payload)
 
         return record
 

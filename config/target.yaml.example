@@ -24,16 +24,43 @@ fuzzing:
     - topology
   dimension_switch_threshold: 3
 
-# OOB (Out-of-Band) 回调服务器配置
+# OOB (Out-of-Band) 回调配置
 # 用于 log4j / 反序列化等需要外部回调确认的漏洞类型
+#
+# 方式 1：dnslog.cn（免费，无需注册，自动获取临时域名）
 oob:
-  server: "oob.example.com"
-  poll_api: "https://oob.example.com/api/poll"
-  api_key: ""
-  poll_interval_ms: 2000
-  poll_timeout_ms: 30000
+  provider: "dnslog"
 
-# 入口 URL 列表
-# Crawler 会从这些 URL 开始爬取，自动发现表单并推断注入点
-entry_urls:
-  - "http://192.168.1.100:81/"
+# 方式 2：ceye.io（更稳定，需注册）
+# oob:
+#   provider: "ceye"
+#   api_token: "your-ceye-api-token"
+#   identifier: "your-ceye-identifier"
+
+# 方式 3：手动指定（兼容旧配置）
+# oob:
+#   server: "your-oob-server.com"
+#   poll_api: "https://your-oob-server.com/api/poll"
+
+# ============================================================
+# 方式一：按漏洞类型配置（推荐）
+# 直接指定每个漏洞类型的 WAF/无-WAF 靶场 URL
+# 系统自动获取页面表单、检测注入参数，无需全站爬取
+# ============================================================
+targets:
+  sqli:
+    waf: "http://111.230.233.61:81/vulnerabilities/sqli/"
+    no_waf: "http://111.230.233.61:8111/vulnerabilities/sqli/"
+  cmdi:
+    waf: "http://111.230.233.61:81/vulnerabilities/cmdi/"
+    no_waf: "http://111.230.233.61:8111/vulnerabilities/cmdi/"
+  log4j: {}  # 暂不测试
+
+# ============================================================
+# 方式二：入口 URL 列表（旧格式，兼容）
+# 1 个 URL → 黑盒模式（单独测试）
+# 2 个 URL → 对比模式（第一个 = WAF 靶场，第二个 = 无 WAF 靶场）
+# ============================================================
+# entry_urls:
+#   - "http://192.168.1.100:81/"
+#   - "http://192.168.1.100:82/"
