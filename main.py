@@ -15,6 +15,7 @@ main.py  Multi-Agent WAF Fuzzer 入口文件
 import sys
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -59,6 +60,40 @@ C_OBSERVER = "\033[1m\033[34m[Observer]\033[0m"  # 蓝色
 C_BYPASS = "\033[1m\033[32m[BYPASS]\033[0m"     # 绿色
 C_BLOCKED = "\033[1m\033[31m[BLOCKED]\033[0m"   # 红色
 C_FLOW = "\033[90m"  # 灰色（流程线）
+
+
+# ============================================================
+# 运行日志文件（同时输出到终端和文件）
+# ============================================================
+
+class _Tee:
+    """同时写入终端和日志文件，自动剥离 ANSI 颜色码。"""
+    _ANSI_RE = __import__("re").compile(r"\033\[[0-9;]*m")
+
+    def __init__(self, terminal, log_file):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    def write(self, msg):
+        self.terminal.write(msg)
+        self.log_file.write(self._ANSI_RE.sub("", msg))
+        self.log_file.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+
+
+def _setup_log_file() -> Path:
+    """创建运行日志文件，将 stdout/stderr 同时输出到终端和文件。返回日志路径。"""
+    log_dir = Path("output/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"run_{timestamp}.log"
+    log_file = open(log_path, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_file)
+    sys.stderr = _Tee(sys.__stderr__, log_file)
+    return log_path
 
 
 # ============================================================
@@ -858,12 +893,16 @@ def run_vuln_type(
 
 def main(config_path: str = "config/target.yaml") -> int:
     """Multi-Agent WAF Fuzzer 主入口。"""
+    # 初始化运行日志文件
+    log_path = _setup_log_file()
+
     # 打印横幅
     print()
     print(f"{C_HEADER}================================================{C_RESET}")
     print(f"{C_HEADER}  WAF-Fuzzer :: Multi-Agent Semantic Bypass Test {C_RESET}")
     print(f"{C_HEADER}================================================{C_RESET}")
     print()
+    _log(C_INFO, f"运行日志: {log_path.resolve()}")
 
     # 加载配置
     config = load_config(config_path)
@@ -928,6 +967,7 @@ def main(config_path: str = "config/target.yaml") -> int:
         _log(C_PHASE, "生成最终报告")
         report = manager.generate_final_report()
         _log(C_OK, f"报告已保存至: {manager._output_dir / 'bypass_report.txt'}")
+        _log(C_OK, f"运行日志已保存至: {log_path.resolve()}")
         return 0
 
     # ----------------------------------------------------------
@@ -1073,6 +1113,7 @@ def main(config_path: str = "config/target.yaml") -> int:
     print()
     print(report)
 
+    _log(C_OK, f"运行日志已保存至: {log_path.resolve()}")
     return 0
 
 
@@ -1088,3 +1129,7 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        # 关闭日志文件句柄
+        if hasattr(sys.stdout, "log_file"):
+            sys.stdout.log_file.close()
