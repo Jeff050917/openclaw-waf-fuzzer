@@ -3,12 +3,14 @@
 manager.py  Manager Agent -- 系统的"大脑"
 
 【核心职责】
-1. 从爬虫结果推断注入点类型
-2. 采集基线响应
-3. 利用 LLM 分析攻击面，制定 AttackPlan
-4. 每轮 LLM 策略决策（RoundDecision）
-5. 记录轮次结果，更新知识库
-6. 生成最终 Bypass 报告
+1. 爬取站点，发现表单和参数
+2. WAF 指纹识别
+3. 从爬虫结果推断注入点类型
+4. 采集基线响应
+5. 利用 LLM 分析攻击面，制定 AttackPlan
+6. 每轮 LLM 策略决策（RoundDecision）
+7. 记录轮次结果，更新知识库
+8. 生成最终 Bypass 报告
 """
 
 from __future__ import annotations
@@ -36,9 +38,10 @@ from agents.models import (
     WAFProfile,
 )
 from baseliner import run_baseline
-from crawler import CandidateForm
+from crawler import CandidateForm, SiteCrawler
 from llm_engine import _chat_json
 from memory_compressor import compress_cot_analyses, consolidate_kb, get_kb_context
+from waf_fingerprinter import WAFFingerprinter
 
 
 # ============================================================
@@ -153,8 +156,30 @@ class Manager:
         self._output_dir = Path("output")
         self._output_dir.mkdir(exist_ok=True)
 
+        # 初始化内部工具
+        fuzz_cfg = config.get("fuzzing", {})
+        timeout = fuzz_cfg.get("request_timeout", 15)
+        self._crawler = SiteCrawler(timeout=timeout)
+        self._fingerprinter = WAFFingerprinter(timeout=timeout)
+
     # ----------------------------------------------------------
-    # 1. 注入点推断
+    # 1. 站点爬取
+    # ----------------------------------------------------------
+
+    def crawl_site(self, entry_url: str) -> list[CandidateForm]:
+        """爬取入口 URL，返回发现的表单列表。"""
+        return self._crawler.crawl(entry_url)
+
+    # ----------------------------------------------------------
+    # 2. WAF 指纹识别
+    # ----------------------------------------------------------
+
+    def fingerprint_waf(self, url: str) -> WAFProfile:
+        """对目标 URL 进行 WAF 指纹识别。"""
+        return self._fingerprinter.fingerprint(url)
+
+    # ----------------------------------------------------------
+    # 3. 注入点推断
     # ----------------------------------------------------------
 
     def infer_injection_types(self, forms: list[CandidateForm]) -> list[InjectionPoint]:
@@ -205,7 +230,7 @@ class Manager:
         return injection_points
 
     # ----------------------------------------------------------
-    # 2. 基线采集
+    # 4. 基线采集
     # ----------------------------------------------------------
 
     def collect_baseline(self, target: InjectionPoint, timeout: int = 15) -> str:
@@ -220,7 +245,7 @@ class Manager:
         return run_baseline(target_dict, timeout=timeout)
 
     # ----------------------------------------------------------
-    # 3. 攻击面分析 (LLM)
+    # 5. 攻击面分析 (LLM)
     # ----------------------------------------------------------
 
     def analyze_attack_surface(
@@ -288,7 +313,7 @@ class Manager:
         )
 
     # ----------------------------------------------------------
-    # 4. 策略决策
+    # 6. 策略决策
     # ----------------------------------------------------------
 
     def decide_strategy(
@@ -389,7 +414,7 @@ class Manager:
         )
 
     # ----------------------------------------------------------
-    # 5. 结果记录
+    # 7. 结果记录
     # ----------------------------------------------------------
 
     def record_round(
@@ -429,7 +454,7 @@ class Manager:
         return record
 
     # ----------------------------------------------------------
-    # 6. 知识库更新
+    # 8. 知识库更新
     # ----------------------------------------------------------
 
     def update_kb(
@@ -454,7 +479,7 @@ class Manager:
             print(f"  [WARN] KB 更新失败: {e}")
 
     # ----------------------------------------------------------
-    # 7. 终止条件判断
+    # 9. 终止条件判断
     # ----------------------------------------------------------
 
     def should_stop(self, current_round: int) -> bool:
@@ -480,7 +505,7 @@ class Manager:
         return False
 
     # ----------------------------------------------------------
-    # 8. 报告生成
+    # 10. 报告生成
     # ----------------------------------------------------------
 
     def generate_final_report(self, output_path: str | None = None) -> str:

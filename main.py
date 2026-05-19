@@ -31,9 +31,7 @@ from agents.manager import Manager
 from agents.models import ObserverRequest, SolverRequest
 from agents.observer import Observer
 from agents.solver import Solver
-from core.crawler import SiteCrawler
 from core.llm_engine import init_client
-from core.waf_fingerprinter import WAFFingerprinter
 
 # ============================================================
 # 终端颜色常量
@@ -82,8 +80,6 @@ def process_entry_url(
     manager: Manager,
     solver: Solver,
     observer: Observer,
-    crawler: SiteCrawler,
-    fingerprinter: WAFFingerprinter,
     llm_model: str,
     oob_config: dict | None,
 ) -> None:
@@ -101,7 +97,7 @@ def process_entry_url(
     # Phase 1: 站点爬取
     # ----------------------------------------------------------
     _log(C_PHASE, "Phase 1: 站点爬取")
-    candidates = crawler.crawl(entry_url)
+    candidates = manager.crawl_site(entry_url)
     _log(C_OK, f"发现 {len(candidates)} 个候选表单")
 
     if not candidates:
@@ -126,7 +122,7 @@ def process_entry_url(
     # Phase 2: WAF 指纹识别
     # ----------------------------------------------------------
     _log(C_PHASE, "Phase 2: WAF 指纹识别")
-    waf_profile = fingerprinter.fingerprint(entry_url)
+    waf_profile = manager.fingerprint_waf(entry_url)
     if waf_profile.detected:
         _log(C_OK, f"检测到 WAF: {waf_profile.waf_name or '未知'} "
              f"(置信度: {waf_profile.confidence:.0%})")
@@ -285,8 +281,6 @@ def main(config_path: str = "config/target.yaml") -> int:
         model=llm_model,
     )
     observer = Observer()
-    crawler = SiteCrawler(timeout=fuzz_cfg.get("request_timeout", 15))
-    fingerprinter = WAFFingerprinter(timeout=fuzz_cfg.get("request_timeout", 15))
     _log(C_OK, "所有 Agent 已初始化")
 
     # OOB 配置
@@ -310,8 +304,6 @@ def main(config_path: str = "config/target.yaml") -> int:
                 manager=manager,
                 solver=solver,
                 observer=observer,
-                crawler=crawler,
-                fingerprinter=fingerprinter,
                 llm_model=llm_model,
                 oob_config=oob_config,
             )
